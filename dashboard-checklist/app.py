@@ -1,13 +1,15 @@
 # app.py
 # Streamlit dashboard — Checklist (CSV Transações) + (opcional) CSV BaaS (bloqueio cautelar)
-# Ajustes pedidos:
-# - Só processa depois de clicar em "Processar" (não renderiza tudo antes)
+# Ajustes:
+# - Só processa depois de clicar em "Processar"
 # - Filtro de empresas obrigatório (baseado no input)
-# - BaaS casa por CONTA (não por company_key), e só mostra o que estiver no filtro
-# - Gráficos coloridos (status por cor; var_30d vermelho <0, verde >0)
+# - BaaS casa por CONTA e só mostra o que estiver no filtro
+# - Gráficos coloridos
 # - Paginação: checklist 15/15, baas 10/10
-#
-# Requisitos: streamlit, pandas, numpy, plotly, unidecode
+# - Paginação sem botões externos (só number_input)
+# - KPIs renomeados
+# - Dropdown Top N (8/10/15) no Top variação 30d
+# - Busca por empresa (Checklist e BaaS)
 
 from __future__ import annotations
 
@@ -78,19 +80,10 @@ def _strip_accents(s: str) -> str:
         return ""
     if unidecode:
         return unidecode(s)
-    # fallback simples
     return s
 
 
 def normalize_company(name: str) -> str:
-    """
-    Normaliza nome para chave:
-    - uppercase
-    - remove acentos
-    - remove pontuação
-    - remove sufixos comuns (LTDA, SA, ME, EPP...)
-    - colapsa espaços
-    """
     s = str(name or "").strip()
     s = _strip_accents(s)
     s = s.upper()
@@ -126,12 +119,6 @@ def split_companies_input(text: str) -> List[str]:
 # Utils: rounding / metrics
 # =========================
 def round_int_nearest(x: float) -> int:
-    """
-    Inteiro SEMPRE, arredonda para unidade mais próxima:
-      1.1 -> 1
-      1.8 -> 2
-      0.5 -> 1 (não bankers rounding)
-    """
     try:
         v = float(x)
     except Exception:
@@ -142,12 +129,6 @@ def round_int_nearest(x: float) -> int:
 
 
 def pct_int_ceil_ratio(var_ratio: float) -> int:
-    """
-    var_ratio é razão (ex.: -0.6012).
-    Converte para % inteiro usando ceil.
-    - Positivo: 80.1 -> 81
-    - Negativo: -60.1 -> -60 (ceil aproxima para zero)
-    """
     try:
         pct = float(var_ratio) * 100.0
     except Exception:
@@ -162,10 +143,6 @@ def safe_div(numer: float, denom: float) -> float:
 
 
 def calc_var(today: float, avg: float) -> float:
-    """
-    Variação relativa vs média.
-    Se avg == 0, retorna 0 (evita explosão).
-    """
     try:
         t = float(today)
         a = float(avg)
@@ -190,9 +167,6 @@ def severity_rank(status: str) -> int:
 
 
 def calc_status(var30: float, *, queda_critica: float, aumento_relevante: float, investigar_abs: float) -> str:
-    """
-    Status baseado em var_30d
-    """
     if var30 <= queda_critica:
         return "Escalar (queda)"
     if abs(var30) >= investigar_abs:
@@ -226,31 +200,16 @@ def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
 
 
 def parse_transactions_csv(uploaded_file) -> pd.DataFrame:
-    """
-    Espera algo parecido com:
-      - Data Transacao: Day (A)
-      - Movement Account ID (B)
-      - Person Name (C)  -> "11086 - Dom Digital"
-      - CREDIT ... (D)
-      - DEBIT ... (E)
-
-    Retorna facts normalizado:
-      date (date), account_id (str), company_name (str), company_key (str), total (float)
-    """
     if uploaded_file is None:
         return pd.DataFrame()
 
-    # tenta ler com separadores comuns
     content = uploaded_file.getvalue()
     if not content:
         return pd.DataFrame()
 
-    # Detecta se é ; ou , ou \t
-    # pandas engine python lida bem com sep=None (infer), mas nem sempre.
     try:
         df = pd.read_csv(uploaded_file, sep=None, engine="python")
     except Exception:
-        # fallback
         uploaded_file.seek(0)
         try:
             df = pd.read_csv(uploaded_file, sep=";", engine="python")
@@ -261,16 +220,13 @@ def parse_transactions_csv(uploaded_file) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # acha colunas
     date_col = _pick_col(df, ["data", "date", "transac", "day"])
     person_col = _pick_col(df, ["person"])
     credit_col = _pick_col(df, ["credit"])
     debit_col = _pick_col(df, ["debit"])
 
-    # valida
     missing = [x for x in [date_col, person_col, credit_col, debit_col] if x is None]
     if missing:
-        # tenta fallback por posição se vier no formato conhecido
         cols = list(df.columns)
         if len(cols) >= 5:
             date_col = date_col or cols[0]
@@ -286,47 +242,31 @@ def parse_transactions_csv(uploaded_file) -> pd.DataFrame:
 
     work = df[[date_col, person_col, credit_col, debit_col]].copy()
 
-    # date
     work["date"] = pd.to_datetime(work[date_col], errors="coerce", dayfirst=True).dt.date
 
-    # person -> "account - company"
     person = work[person_col].astype(str).fillna("")
-    # separa no primeiro " - "
     parts = person.str.split(" - ", n=1, expand=True)
     account = parts[0].fillna("").astype(str).str.strip()
     company = (parts[1] if parts.shape[1] > 1 else "").fillna("").astype(str).str.strip()
-
-    # se company ficou vazio (casos estranhos), usa o próprio person
     company = np.where(company == "", person, company)
 
-    # remove lixo no account (mantém dígitos)
     account = account.str.replace(r"\D+", "", regex=True)
     account = account.replace("", np.nan)
 
     work["account_id"] = account.astype("string")
     work["company_name"] = pd.Series(company).astype(str)
 
-    # credit/debit numéricos
     credit = pd.to_numeric(work[credit_col], errors="coerce").fillna(0.0)
     debit = pd.to_numeric(work[debit_col], errors="coerce").fillna(0.0)
     work["total"] = (credit + debit).astype(float)
 
-    # drop inválidos
     work = work.dropna(subset=["date", "account_id"])
     work["company_key"] = work["company_name"].apply(normalize_company)
 
-    facts = work[["date", "account_id", "company_name", "company_key", "total"]].copy()
-    return facts
+    return work[["date", "account_id", "company_name", "company_key", "total"]].copy()
 
 
 def parse_baas_csv(uploaded_file) -> pd.DataFrame:
-    """
-    CSV BaaS:
-      Posição | Conta | Agência | Nome | Plano | Saldo | Saldo Bloqueado | BaaS
-
-    Retorna DataFrame com:
-      posicao, conta(str), agencia, nome, nome_key, saldo_bloqueado(float), plano, saldo
-    """
     if uploaded_file is None:
         return pd.DataFrame()
 
@@ -334,7 +274,6 @@ def parse_baas_csv(uploaded_file) -> pd.DataFrame:
     if not content:
         return pd.DataFrame()
 
-    # tenta infer sep
     try:
         df = pd.read_csv(uploaded_file, sep=None, engine="python")
     except Exception:
@@ -348,21 +287,18 @@ def parse_baas_csv(uploaded_file) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # mapeia colunas por nome (robusto)
     pos_col = _pick_col(df, ["posição", "posicao", "pos"])
     conta_col = _pick_col(df, ["conta"])
     ag_col = _pick_col(df, ["agência", "agencia"])
     nome_col = _pick_col(df, ["nome"])
     plano_col = _pick_col(df, ["plano"])
-    saldo_col = _pick_col(df, ["saldo"])  # vai achar "saldo" e pode pegar o errado; ajusta abaixo
+    saldo_col = _pick_col(df, ["saldo"])
     bloqueado_col = _pick_col(df, ["bloquead"])
 
-    # Corrige: se saldo_col pegou "saldo bloqueado", troca
     if saldo_col and "bloquead" in saldo_col.lower():
         saldo_col = None
 
     if not conta_col or not bloqueado_col or not nome_col:
-        # fallback por posição se tiver as 8 colunas esperadas
         cols = list(df.columns)
         if len(cols) >= 7:
             pos_col = pos_col or cols[0]
@@ -412,8 +348,8 @@ def parse_baas_csv(uploaded_file) -> pd.DataFrame:
 def accounts_activity_for_company(
     base_acc: pd.DataFrame,
     company_key: str,
-    start: pd.Timestamp,
-    end: pd.Timestamp,
+    start,
+    end,
 ) -> Tuple[List[str], List[str]]:
     mask = (
         (base_acc["company_key"] == company_key)
@@ -432,7 +368,6 @@ def accounts_activity_for_company(
 
     active = sorted(set(active))
     zero = sorted(set(zero))
-
     return active, zero
 
 
@@ -441,32 +376,24 @@ def build_checklist(
     companies_keys: List[str],
     thresholds: Thresholds,
 ) -> Tuple[str, pd.DataFrame, pd.DataFrame]:
-    """
-    Retorna:
-      day_ref_iso, df_checklist, df_cards (apenas alertas)
-    """
     if facts.empty:
         return "", pd.DataFrame(), pd.DataFrame()
 
-    # filtra empresas do input
     if companies_keys:
         facts = facts[facts["company_key"].isin(set(companies_keys))].copy()
 
     if facts.empty:
         return "", pd.DataFrame(), pd.DataFrame()
 
-    # day_ref = maior data do CSV
     day_ref = max(facts["date"])
     day_ref = pd.to_datetime(day_ref)
     d1 = (day_ref - timedelta(days=1)).date()
 
-    # base diária por conta
     base_acc = (
         facts.groupby(["account_id", "company_key", "company_name", "date"], as_index=False)["total"]
         .sum()
     )
 
-    # base diária por empresa
     base_comp = (
         base_acc.groupby(["company_key", "company_name", "date"], as_index=False)["total"]
         .sum()
@@ -554,9 +481,7 @@ def build_checklist(
         return day_ref.date().isoformat(), df, pd.DataFrame()
 
     df = df.sort_values(["severity", "company_name"], ascending=[True, True]).reset_index(drop=True)
-
     df_cards = df[df["status"] != "Normal"].copy()
-
     return day_ref.date().isoformat(), df, df_cards
 
 
@@ -567,18 +492,9 @@ def enrich_with_baas(
     df_checklist: pd.DataFrame,
     df_baas: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
-    """
-    - NÃO usa company_key no BaaS
-    - Casa por CONTA:
-        checklist.accounts_list -> lista de contas
-        df_baas.conta -> saldo_bloqueado
-    Retorna:
-      df_checklist2 (com colunas: has_block, blocked_total, blocked_accounts, lock_icon)
-      df_baas_table (apenas contas do filtro com saldo_bloqueado>0)
-      kpi_blocked_accounts (n contas únicas bloqueadas no filtro)
-    """
     if df_checklist is None or df_checklist.empty:
         return df_checklist, pd.DataFrame(), 0
+
     if df_baas is None or df_baas.empty:
         out = df_checklist.copy()
         out["has_block"] = False
@@ -587,7 +503,6 @@ def enrich_with_baas(
         out["lock_icon"] = UNKNOWN_ICON
         return out, pd.DataFrame(), 0
 
-    # normaliza colunas do baas
     if "conta" not in df_baas.columns or "saldo_bloqueado" not in df_baas.columns:
         raise ValueError("CSV BaaS: esperado colunas 'conta' e 'saldo_bloqueado' após parse_baas_csv().")
 
@@ -595,8 +510,6 @@ def enrich_with_baas(
     baas["conta"] = baas["conta"].astype(str).str.strip().str.replace(r"\D+", "", regex=True)
     baas["saldo_bloqueado"] = pd.to_numeric(baas["saldo_bloqueado"], errors="coerce").fillna(0.0).astype(float)
 
-    # índice por conta
-    # (pode ter duplicadas; agrega)
     baas_agg = (
         baas.groupby("conta", as_index=False)["saldo_bloqueado"].sum()
         .sort_values("saldo_bloqueado", ascending=False)
@@ -606,7 +519,6 @@ def enrich_with_baas(
         if not s:
             return []
         parts = [p.strip() for p in str(s).split(",") if p.strip()]
-        # garante só dígitos
         out = []
         for p in parts:
             p2 = re.sub(r"\D+", "", p)
@@ -623,8 +535,6 @@ def enrich_with_baas(
     blocked_accounts_list = []
     lock_icon_list = []
 
-    # cria uma tabela detalhada por conta bloqueada (apenas do filtro)
-    # para isso, precisamos do "join" conta->linha original do baas (posicao/agencia/nome...)
     baas_by_conta = baas.copy()
 
     for _, row in out.iterrows():
@@ -636,7 +546,6 @@ def enrich_with_baas(
             lock_icon_list.append(UNKNOWN_ICON)
             continue
 
-        # contas com bloqueio
         hit = baas_agg[baas_agg["conta"].isin(accounts) & (baas_agg["saldo_bloqueado"] > 0)].copy()
 
         if hit.empty:
@@ -657,7 +566,6 @@ def enrich_with_baas(
         blocked_accounts_list.append(", ".join(contas_hit))
         lock_icon_list.append(LOCK_ICON)
 
-        # detalhado (pega a primeira linha do baas dessa conta)
         det = baas_by_conta[baas_by_conta["conta"].isin(contas_hit)].copy()
         if not det.empty:
             det["company_key"] = row["company_key"]
@@ -669,13 +577,9 @@ def enrich_with_baas(
     out["blocked_accounts"] = blocked_accounts_list
     out["lock_icon"] = lock_icon_list
 
-    # tabela baas detalhada (só contas bloqueadas das empresas filtradas)
     if blocked_rows:
         df_baas_table = pd.concat(blocked_rows, ignore_index=True)
-        # filtra apenas bloqueadas > 0
         df_baas_table = df_baas_table[df_baas_table["saldo_bloqueado"] > 0].copy()
-
-        # ordena por maior bloqueio
         df_baas_table = df_baas_table.sort_values("saldo_bloqueado", ascending=False).reset_index(drop=True)
     else:
         df_baas_table = pd.DataFrame()
@@ -700,7 +604,6 @@ def fmt_money_pt(x: float) -> str:
         v = float(x)
     except Exception:
         v = 0.0
-    # "1.234.567,89"
     s = f"{v:,.2f}"
     s = s.replace(",", "X").replace(".", ",").replace("X", ".")
     return s
@@ -716,11 +619,18 @@ def fmt_pct_int(x: int) -> str:
 
 def paginate_df(df: pd.DataFrame, page_size: int, key: str) -> Tuple[pd.DataFrame, int, int]:
     if df is None or df.empty:
+        st.session_state[key] = 1
         return df, 1, 1
+
     total = len(df)
     pages = max(1, int(math.ceil(total / page_size)))
-    page = st.session_state.get(key, 1)
-    page = max(1, min(pages, int(page)))
+
+    if key not in st.session_state:
+        st.session_state[key] = 1
+
+    st.session_state[key] = max(1, min(int(st.session_state[key]), pages))
+    page = int(st.session_state[key])
+
     start = (page - 1) * page_size
     end = start + page_size
     return df.iloc[start:end].copy(), page, pages
@@ -728,17 +638,36 @@ def paginate_df(df: pd.DataFrame, page_size: int, key: str) -> Tuple[pd.DataFram
 
 def render_pagination_controls(pages: int, state_key: str, label: str):
     if pages <= 1:
+        st.session_state[state_key] = 1
         return
-    c1, c2, c3 = st.columns([1, 2, 1])
-    with c1:
-        if st.button("◀", key=f"{state_key}_prev", use_container_width=True):
-            st.session_state[state_key] = max(1, int(st.session_state.get(state_key, 1)) - 1)
-    with c2:
-        st.number_input(label, min_value=1, max_value=pages, value=int(st.session_state.get(state_key, 1)),
-                        step=1, key=state_key)
-    with c3:
-        if st.button("▶", key=f"{state_key}_next", use_container_width=True):
-            st.session_state[state_key] = min(pages, int(st.session_state.get(state_key, 1)) + 1)
+
+    if state_key not in st.session_state:
+        st.session_state[state_key] = 1
+
+    st.session_state[state_key] = max(1, min(int(st.session_state[state_key]), pages))
+
+    st.number_input(
+        label,
+        min_value=1,
+        max_value=pages,
+        step=1,
+        key=state_key,
+    )
+
+
+def filter_by_company_name(df: pd.DataFrame, query: str, col: str) -> pd.DataFrame:
+    """
+    Filtro case-insensitive simples por substring.
+    - df[col] deve existir
+    """
+    q = (query or "").strip()
+    if not q:
+        return df
+    try:
+        mask = df[col].astype(str).str.contains(q, case=False, na=False)
+        return df.loc[mask].copy()
+    except Exception:
+        return df
 
 
 # =========================
@@ -788,7 +717,6 @@ process = st.button("Processar", type="primary", use_container_width=True)
 # Processing (only on click)
 # =========================
 if process:
-    # valida
     companies_keys = split_companies_input(companies_text)
     if not companies_keys:
         st.error("Você precisa informar pelo menos 1 empresa no input antes de processar.")
@@ -798,23 +726,21 @@ if process:
         st.stop()
 
     with st.spinner("Lendo CSVs e calculando checklist..."):
-        # parse transações
         facts = parse_transactions_csv(trans_file)
         if facts.empty:
             st.error("O CSV de transações foi lido, mas ficou vazio após normalização (datas/contas inválidas).")
             st.stop()
 
         day_ref, df_checklist, df_cards = build_checklist(facts, companies_keys, thresholds)
+
         if df_checklist.empty:
             st.warning("Nenhuma empresa do input apareceu no CSV (após normalização), ou não há contas ativas no período.")
-            # ainda salva estado vazio
             st.session_state["day_ref"] = day_ref
             st.session_state["df_checklist"] = df_checklist
             st.session_state["df_cards"] = df_cards
             st.session_state["df_baas_table"] = pd.DataFrame()
             st.session_state["kpi_blocked_accounts"] = 0
         else:
-            # parse baas (opcional) + enrich
             if baas_file is not None:
                 df_baas = parse_baas_csv(baas_file)
             else:
@@ -824,13 +750,13 @@ if process:
 
             st.session_state["day_ref"] = day_ref
             st.session_state["df_checklist"] = df_checklist2
-            st.session_state["df_cards"] = df_cards  # cards derivam do checklist; você pode re-gerar se quiser
+            st.session_state["df_cards"] = df_cards
             st.session_state["df_baas_table"] = df_baas_table
             st.session_state["kpi_blocked_accounts"] = kpi_blocked_accounts
 
-            # reset pages
             st.session_state["page_checklist"] = 1
             st.session_state["page_baas"] = 1
+
 
 # =========================
 # Render (only after process)
@@ -842,14 +768,14 @@ if "df_checklist" in st.session_state:
     day_ref = st.session_state.get("day_ref", "—")
     kpi_blocked_accounts = int(st.session_state.get("kpi_blocked_accounts", 0))
 
-    # KPIs
+    # KPIs (renomeados)
     k1, k2, k3, k4, k5 = st.columns(5, gap="small")
 
     with k1:
         st.metric("Dia de referência", day_ref)
 
     with k2:
-        st.metric("Empresas no checklist", fmt_int_pt(len(df_checklist)))
+        st.metric("Empresas filtradas", fmt_int_pt(len(df_checklist)))
 
     with k3:
         alerts_count = int((df_checklist["status"] != "Normal").sum()) if not df_checklist.empty else 0
@@ -857,7 +783,7 @@ if "df_checklist" in st.session_state:
 
     with k4:
         critical = int((df_checklist["status"] == "Escalar (queda)").sum()) if not df_checklist.empty else 0
-        st.metric("Críticos", fmt_int_pt(critical))
+        st.metric("Alertas críticos", fmt_int_pt(critical))
 
     with k5:
         st.metric("Contas com bloqueio", fmt_int_pt(kpi_blocked_accounts))
@@ -872,7 +798,6 @@ if "df_checklist" in st.session_state:
     else:
         c1, c2 = st.columns(2, gap="large")
 
-        # Status chart
         with c1:
             st.caption("Alertas por status")
 
@@ -884,8 +809,6 @@ if "df_checklist" in st.session_state:
                     .size()
                     .rename(columns={"size": "count"})
                 )
-
-                # garante ordem
                 sc["order"] = sc["status"].apply(lambda s: STATUS_ORDER.index(s) if s in STATUS_ORDER else 999)
                 sc = sc.sort_values("order").drop(columns=["order"])
 
@@ -906,19 +829,20 @@ if "df_checklist" in st.session_state:
                 fig1.update_traces(marker_line_width=0)
                 st.plotly_chart(fig1, use_container_width=True)
 
-        # Top var chart
         with c2:
+            # dropdown top N (8/10/15)
+            topn = st.selectbox("Top N", [8, 10, 15], index=0, key="topn_var30")
+
             st.caption("Top variação 30d (piores / melhores)")
 
             if df_checklist.empty:
                 st.info("Sem dados.")
             else:
-                topn = 8
                 tmp = df_checklist[["company_name", "var_30d"]].copy()
                 tmp["var_30d"] = pd.to_numeric(tmp["var_30d"], errors="coerce").fillna(0.0)
 
-                worst = tmp.sort_values("var_30d", ascending=True).head(topn)
-                best = tmp.sort_values("var_30d", ascending=False).head(topn)
+                worst = tmp.sort_values("var_30d", ascending=True).head(int(topn))
+                best = tmp.sort_values("var_30d", ascending=False).head(int(topn))
                 merged = pd.concat([worst, best], ignore_index=True)
 
                 merged["sign"] = np.where(merged["var_30d"] >= 0, "pos", "neg")
@@ -938,7 +862,7 @@ if "df_checklist" in st.session_state:
                     margin=dict(l=10, r=10, t=10, b=10),
                 )
                 fig2.update_traces(marker_line_width=0)
-                fig2.update_yaxes(tickformat=".0%")  # var é razão, plotly formata como %
+                fig2.update_yaxes(tickformat=".0%")
                 st.plotly_chart(fig2, use_container_width=True)
 
     st.divider()
@@ -949,13 +873,14 @@ if "df_checklist" in st.session_state:
     if df_checklist.empty:
         st.info("Sem empresas para mostrar (verifique o filtro e os CSVs).")
     else:
-        # coluna visual de bloqueio (cadeado) — sem “BLOQUEIO/SEM BLOQUEIO” escrito
-        view = df_checklist.copy()
+        # busca por empresa (Checklist)
+        q_check = st.text_input("Buscar empresa (Checklist)", placeholder="Digite parte do nome...", key="q_checklist")
 
-        # status + cadeado junto (visual)
+        view = df_checklist.copy()
+        view = filter_by_company_name(view, q_check, "company_name")
+
         view["status_view"] = view["status"].astype(str) + " " + view.get("lock_icon", UNKNOWN_ICON).astype(str)
 
-        # exibição (inteiros)
         show_cols = [
             "status_view",
             "company_name",
@@ -979,30 +904,29 @@ if "df_checklist" in st.session_state:
             "obs": "Motivo",
         })
 
-        # formata var %
         view_show["Var 30d"] = view_show["Var 30d"].apply(fmt_pct_int)
 
-        # paginação
+        # se o filtro mudou e deixou a página inválida, a paginação já clampa
         st.session_state.setdefault("page_checklist", 1)
         page_df, page, pages = paginate_df(view_show, page_size=int(page_size_checklist), key="page_checklist")
 
         render_pagination_controls(pages, "page_checklist", f"Página Checklist (1–{pages})")
-
         st.dataframe(page_df, use_container_width=True, hide_index=True)
 
     st.divider()
 
-    # BaaS Checklist (por conta)
+    # BaaS Checklist
     st.subheader("Checklist Bloqueio Cautelar (BaaS) — por conta")
 
     if df_baas_table is None or df_baas_table.empty:
         st.caption("Sem dados de BaaS (ou nenhum bloqueio encontrado para as empresas filtradas).")
     else:
-        # monta tabela final
-        t = df_baas_table.copy()
+        # busca por empresa (BaaS)
+        q_baas = st.text_input("Buscar empresa (BaaS)", placeholder="Digite parte do nome...", key="q_baas")
 
-        # garante colunas esperadas
-        # (posicao/agencia podem não existir dependendo do CSV)
+        t = df_baas_table.copy()
+        t = filter_by_company_name(t, q_baas, "company_name")
+
         cols = []
         if "posicao" in t.columns:
             cols.append("posicao")
@@ -1013,7 +937,6 @@ if "df_checklist" in st.session_state:
 
         t = t[cols].copy()
 
-        # rename
         rename = {
             "posicao": "Posição",
             "conta": "Conta",
@@ -1023,10 +946,8 @@ if "df_checklist" in st.session_state:
         }
         t = t.rename(columns=rename)
 
-        # format dinheiro
         t["Saldo Bloqueado"] = t["Saldo Bloqueado"].apply(fmt_money_pt)
 
-        # paginação 10/10
         st.session_state.setdefault("page_baas", 1)
         page_df, page, pages = paginate_df(t, page_size=int(page_size_baas), key="page_baas")
 
@@ -1035,20 +956,18 @@ if "df_checklist" in st.session_state:
 
     st.divider()
 
-    # Cards (texto)
+    # Cards
     st.subheader("Cards (para colar no Discord)")
 
     if df_cards is None or df_cards.empty:
         st.caption("Nenhum alerta (status != Normal).")
     else:
-        # exibe como "cards" simples
         for _, r in df_cards.iterrows():
-            lock_icon = "⚪"
+            lock_icon = UNKNOWN_ICON
             if "lock_icon" in df_checklist.columns:
-                # pega do checklist final por company_key
                 match = df_checklist[df_checklist["company_key"] == r["company_key"]]
                 if not match.empty:
-                    lock_icon = str(match.iloc[0].get("lock_icon", "⚪"))
+                    lock_icon = str(match.iloc[0].get("lock_icon", UNKNOWN_ICON))
 
             title = f"{r['status']} {lock_icon} — {r['company_name']}"
             with st.expander(title, expanded=False):
