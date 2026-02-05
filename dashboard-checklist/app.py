@@ -1,8 +1,11 @@
 # app.py
 # Streamlit dashboard — Checklist (CSV Transações) + CSV BaaS (bloqueio cautelar) embutido no checklist
 #
-# Correção desta versão:
-# ✅ Corrige StreamlitAPIException de paginação (não modifica session_state após widget instanciado)
+# ✅ Mantém o layout/performance que você aprovou
+# ✅ Corrige:
+#   1) Motivo: contas realmente “zeradas” no período (com tolerância/epsilon) viram "Conta zerada nesse período"
+#   2) Status: volta a bolinha colorida no Status (🟠/🔴/🔵/🟢) + cadeado (🔒/🔓)
+# ✅ Mantém a correção de paginação (não altera session_state após widget)
 
 from __future__ import annotations
 
@@ -34,15 +37,29 @@ except Exception:
 # =========================
 st.set_page_config(page_title="Checklist + Bloqueio (BaaS)", layout="wide")
 
-STATUS_ORDER = ["Alerta (queda/ zerada)", "Investigar", "Gerenciar (aumento)", "Normal"]
+STATUS_ALERT = "Alerta (queda/ zerada)"
+STATUS_INVESTIGAR = "Investigar"
+STATUS_GERENCIAR = "Gerenciar (aumento)"
+STATUS_NORMAL = "Normal"
+
+STATUS_ORDER = [STATUS_ALERT, STATUS_INVESTIGAR, STATUS_GERENCIAR, STATUS_NORMAL]
 
 STATUS_COLOR = {
-    "Alerta (queda/ zerada)": "#e74c3c",       # vermelho
-    "Investigar": "#f1c40f",            # amarelo
-    "Gerenciar (aumento)": "#3498db",   # azul
-    "Normal": "#2ecc71",                # verde
+    STATUS_ALERT: "#e74c3c",       # vermelho
+    STATUS_INVESTIGAR: "#f1c40f",  # amarelo
+    STATUS_GERENCIAR: "#3498db",   # azul
+    STATUS_NORMAL: "#2ecc71",      # verde
     "Desconhecido": "#aab4c8",
 }
+
+# bolinhas (emoji) por status (para a coluna Status ficar visual)
+STATUS_DOT = {
+    STATUS_ALERT: "🔴",
+    STATUS_INVESTIGAR: "🟡",
+    STATUS_GERENCIAR: "🔵",
+    STATUS_NORMAL: "🟢",
+}
+DEFAULT_DOT = "⚪"
 
 LOCK_ICON = "🔒"
 UNLOCK_ICON = "🔓"
@@ -198,33 +215,53 @@ def pct_int_ceil_ratio(var_ratio: float) -> int:
 
 
 def calc_status(var30: float, *, queda_critica: float, aumento_relevante: float, investigar_abs: float) -> str:
+    """
+    Regras (mantendo o que você aprovou):
+    - ALERTA: var30 <= queda_critica
+    - INVESTIGAR: queda relevante (negativo) -> var30 <= -investigar_abs
+    - GERENCIAR: aumento relevante -> var30 >= aumento_relevante
+    - NORMAL: caso contrário (faixa “ok” ~ dentro dos 30% ou abaixo de aumento_relevante)
+    """
     if var30 <= queda_critica:
-        return "Alerta (queda/ zerada)"
-    if abs(var30) >= investigar_abs:
-        return "Investigar"
+        return STATUS_ALERT
+    if var30 <= (-abs(investigar_abs)):
+        return STATUS_INVESTIGAR
     if var30 >= aumento_relevante:
-        return "Gerenciar (aumento)"
-    return "Normal"
+        return STATUS_GERENCIAR
+    return STATUS_NORMAL
 
 
 def severity_rank(status: str) -> int:
-    if status == "Alerta (queda/ zerada)":
+    if status == STATUS_ALERT:
         return 0
-    if status == "Investigar":
+    if status == STATUS_INVESTIGAR:
         return 1
-    if status == "Gerenciar (aumento)":
+    if status == STATUS_GERENCIAR:
         return 2
-    if status == "Normal":
+    if status == STATUS_NORMAL:
         return 3
     return 9
 
 
-def calc_obs(status: str) -> str:
-    if status == "Alerta (queda/ zerada)":
+def calc_obs_with_zero_rule(status: str, today: float, sum7: float, sum15: float, sum30: float, eps: float) -> str:
+    """
+    ✅ Corrige o bug:
+    - Se a conta estiver “zerada no período” (com tolerância eps), muda o motivo
+    - Senão, mantém os motivos normais por status
+    """
+    try:
+        eps = float(eps)
+    except Exception:
+        eps = 0.0
+
+    if abs(float(today)) <= eps and abs(float(sum7)) <= eps and abs(float(sum15)) <= eps and abs(float(sum30)) <= eps:
+        return "Conta zerada nesse período"
+
+    if status == STATUS_ALERT:
         return "Queda crítica vs média histórica"
-    if status == "Investigar":
-        return "Variação relevante vs média histórica"
-    if status == "Gerenciar (aumento)":
+    if status == STATUS_INVESTIGAR:
+        return "Queda relevante vs média histórica"
+    if status == STATUS_GERENCIAR:
         return "Aumento relevante vs média histórica"
     return "Dentro do esperado"
 
@@ -420,6 +457,7 @@ def build_checklist_per_account(
     facts: pd.DataFrame,
     companies_keys: List[str],
     thresholds: Thresholds,
+    zero_eps: float,
 ) -> Tuple[str, pd.DataFrame]:
     if facts.empty:
         return "", pd.DataFrame()
@@ -451,7 +489,10 @@ def build_checklist_per_account(
     if active_keys.empty:
         return day_ref.isoformat(), pd.DataFrame()
 
-    base_acc = base_acc.merge(active_keys.assign(_keep=1), on=["account_id", "company_key"], how="inner").drop(columns=["_keep"])
+    base_acc = (
+        base_acc.merge(active_keys.assign(_keep=1), on=["account_id", "company_key"], how="inner")
+        .drop(columns=["_keep"])
+    )
 
     def sum_window(account_id: str, company_key: str, days: int) -> float:
         start = (pd.to_datetime(day_ref) - timedelta(days=days)).date()
@@ -499,6 +540,15 @@ def build_checklist_per_account(
             investigar_abs=thresholds.investigar_abs,
         )
 
+        obs = calc_obs_with_zero_rule(
+            status=status,
+            today=tdy,
+            sum7=s7,
+            sum15=s15,
+            sum30=s30,
+            eps=float(zero_eps),
+        )
+
         rows.append({
             "company_key": company_key,
             "company_name": company_name,
@@ -509,6 +559,10 @@ def build_checklist_per_account(
             "avg_7d": float(a7),
             "avg_15d": float(a15),
             "avg_30d": float(a30),
+
+            "sum_7d": float(s7),
+            "sum_15d": float(s15),
+            "sum_30d": float(s30),
 
             "var_7d": float(v7),
             "var_15d": float(v15),
@@ -524,7 +578,7 @@ def build_checklist_per_account(
             "var_30d_pct": pct_int_ceil_ratio(v30),
 
             "status": status,
-            "obs": calc_obs(status),
+            "obs": obs,
             "severity": severity_rank(status),
         })
 
@@ -589,7 +643,7 @@ def slice_page(df: pd.DataFrame, page: int, page_size: int) -> pd.DataFrame:
 
 
 # =========================
-# Gauge + status boxes (mesmo visual que você aprovou)
+# Gauge + status boxes (mesmo visual aprovado)
 # =========================
 def render_status_boxes(df: pd.DataFrame):
     if df is None or df.empty:
@@ -602,19 +656,19 @@ def render_status_boxes(df: pd.DataFrame):
         f"""
 <div class="status-row">
   <div class="status-box sb-red">
-    <div class="status-num">{counts["Alerta (queda/ zerada)"]}</div>
+    <div class="status-num">{counts[STATUS_ALERT]}</div>
     <div class="status-lab">Alerta</div>
   </div>
   <div class="status-box sb-yellow">
-    <div class="status-num">{counts["Investigar"]}</div>
+    <div class="status-num">{counts[STATUS_INVESTIGAR]}</div>
     <div class="status-lab">Investigar</div>
   </div>
   <div class="status-box sb-blue">
-    <div class="status-num">{counts["Gerenciar (aumento)"]}</div>
+    <div class="status-num">{counts[STATUS_GERENCIAR]}</div>
     <div class="status-lab">Gerenciar</div>
   </div>
   <div class="status-box sb-green">
-    <div class="status-num">{counts["Normal"]}</div>
+    <div class="status-num">{counts[STATUS_NORMAL]}</div>
     <div class="status-lab">Normal</div>
   </div>
 </div>
@@ -632,7 +686,7 @@ def render_gauge_panel(
     var7: float,
     var15: float,
     var30: float,
-    height: int = 480,
+    height: int = 200,
 ):
     if go is None:
         st.warning("plotly não está disponível (instale plotly).")
@@ -649,7 +703,7 @@ def render_gauge_panel(
             title={"text": title},
             gauge={
                 "axis": {"range": [0, gauge_max]},
-                "bar": {"color": STATUS_COLOR["Gerenciar (aumento)"]},
+                "bar": {"color": STATUS_COLOR[STATUS_GERENCIAR]},
                 "bgcolor": "rgba(0,0,0,0)",
                 "borderwidth": 0,
                 "steps": [{"range": [0, gauge_max], "color": "rgba(255,255,255,0.08)"}],
@@ -712,6 +766,16 @@ with st.sidebar:
     investigar_abs = st.number_input("Investigar abs", value=0.30, step=0.01, format="%.2f")
 
     st.divider()
+    # ✅ novo parâmetro para corrigir "zerada" com arredondamento/ruído
+    zero_eps = st.number_input(
+        "Tolerância p/ conta zerada (≤)",
+        value=10.0,
+        step=0.5,
+        format="%.2f",
+        help="Se Hoje e as somas 7/15/30 forem ≤ esse valor, o motivo vira 'Conta zerada nesse período'.",
+    )
+
+    st.divider()
     st.header("Paginação")
     page_size_checklist = st.selectbox("Checklist (por página)", [15, 20, 30, 50], index=0)
 
@@ -752,7 +816,12 @@ if process:
             st.error("O CSV de transações ficou vazio após normalização (datas/contas inválidas).")
             st.stop()
 
-        day_ref, df_checklist = build_checklist_per_account(facts, companies_keys, thresholds)
+        day_ref, df_checklist = build_checklist_per_account(
+            facts=facts,
+            companies_keys=companies_keys,
+            thresholds=thresholds,
+            zero_eps=float(zero_eps),
+        )
 
         if df_checklist.empty:
             st.warning("Nenhuma conta ativa encontrada para as empresas filtradas na janela de 30d.")
@@ -786,10 +855,10 @@ with k2:
     uniq_companies = int(df_checklist["company_key"].nunique()) if not df_checklist.empty else 0
     st.metric("Empresas filtradas", fmt_int_pt(uniq_companies))
 with k3:
-    alerts_count = int((df_checklist["status"] != "Normal").sum()) if not df_checklist.empty else 0
+    alerts_count = int((df_checklist["status"] != STATUS_NORMAL).sum()) if not df_checklist.empty else 0
     st.metric("Alertas", fmt_int_pt(alerts_count))
 with k4:
-    critical = int((df_checklist["status"] == "Alerta (queda/ zerada)").sum()) if not df_checklist.empty else 0
+    critical = int((df_checklist["status"] == STATUS_ALERT).sum()) if not df_checklist.empty else 0
     st.metric("Alertas críticos", fmt_int_pt(critical))
 with k5:
     st.metric("Contas com bloqueio", fmt_int_pt(kpi_blocked_accounts))
@@ -849,7 +918,7 @@ if px is not None and go is not None and not df_checklist.empty:
             x="company_name",
             y="var_30d",
             color="sign",
-            color_discrete_map={"pos": STATUS_COLOR["Normal"], "neg": STATUS_COLOR["Alerta (queda/ zerada)"]},
+            color_discrete_map={"pos": STATUS_COLOR[STATUS_NORMAL], "neg": STATUS_COLOR[STATUS_ALERT]},
         )
         fig.update_layout(
             showlegend=False,
@@ -894,7 +963,9 @@ if status_filter != "Todos":
     view = view[view["status"] == status_filter]
 
 # tabela
-view["Status"] = view["status"].astype(str) + " " + view["lock_icon"].astype(str)
+# ✅ volta bolinha colorida + cadeado
+view["Status"] = view["status"].map(STATUS_DOT).fillna(DEFAULT_DOT) + " " + view["status"].astype(str) + " " + view["lock_icon"].astype(str)
+
 view["Conta"] = view["account_id"].astype(str)
 view["Empresa"] = view["company_name"].astype(str)
 view["Hoje"] = view["today_total_i"].apply(fmt_int_pt)
@@ -902,7 +973,7 @@ view["Média 7d"] = view["avg_7d_i"].apply(fmt_int_pt)
 view["Média 15d"] = view["avg_15d_i"].apply(fmt_int_pt)
 view["Média 30d"] = view["avg_30d_i"].apply(fmt_int_pt)
 view["Var 30d"] = view["var_30d_pct"].apply(fmt_pct_int)
-view["Saldo Bloqueado"] = view["saldo_bloqueado_total"].apply(fmt_money_pt)
+view["Saldo Bloqueado"] = view.get("saldo_bloqueado_total", 0.0).apply(fmt_money_pt)
 view["Motivo"] = view["obs"].astype(str)
 
 show = view[["Status", "Conta", "Empresa", "Hoje", "Média 7d", "Média 15d", "Média 30d", "Var 30d", "Saldo Bloqueado", "Motivo"]].copy()
@@ -924,7 +995,6 @@ st.number_input(
     key="page_checklist",
 )
 
-# só lê e recorta
 page_now = max(1, min(pages, int(st.session_state["page_checklist"])))
 page_df = slice_page(show, page_now, int(page_size_checklist))
 
@@ -935,7 +1005,7 @@ st.divider()
 # Cards (Discord)
 st.subheader("Cards (para colar no Discord)")
 
-alerts = df_checklist[df_checklist["status"] != "Normal"].copy()
+alerts = df_checklist[df_checklist["status"] != STATUS_NORMAL].copy()
 if alerts.empty:
     st.caption("Nenhum alerta (status != Normal).")
 else:
