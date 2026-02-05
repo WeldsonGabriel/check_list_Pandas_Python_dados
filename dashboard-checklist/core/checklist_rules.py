@@ -76,7 +76,7 @@ def calc_var(today_total: float, avg: float) -> float:
 def calc_status(var30: float, *, queda_critica: float, aumento_relevante: float, investigar_abs: float) -> str:
     # Mantém sua semântica
     if var30 <= queda_critica:
-        return "Escalar (queda)"
+        return "Alerta (queda/ zerada)"
     if var30 >= aumento_relevante:
         return "Gerenciar (aumento)"
     if abs(var30) >= investigar_abs:
@@ -85,7 +85,7 @@ def calc_status(var30: float, *, queda_critica: float, aumento_relevante: float,
 
 
 def calc_obs(status: str) -> str:
-    if status == "Escalar (queda)":
+    if status == "Alerta (quedaqueda/ zerada)":
         return "Queda crítica vs média histórica"
     if status == "Gerenciar (aumento)":
         return "Aumento relevante vs média histórica"
@@ -97,7 +97,7 @@ def calc_obs(status: str) -> str:
 def severity_rank(status: str) -> int:
     # menor = mais crítico
     order = {
-        "Escalar (queda)": 0,
+        "Alerta (quedaqueda/ zerada)": 0,
         "Investigar": 1,
         "Gerenciar (aumento)": 2,
         "Normal": 3,

@@ -34,10 +34,10 @@ except Exception:
 # =========================
 st.set_page_config(page_title="Checklist + Bloqueio (BaaS)", layout="wide")
 
-STATUS_ORDER = ["Escalar (queda)", "Investigar", "Gerenciar (aumento)", "Normal"]
+STATUS_ORDER = ["Alerta (queda/ zerada)", "Investigar", "Gerenciar (aumento)", "Normal"]
 
 STATUS_COLOR = {
-    "Escalar (queda)": "#e74c3c",       # vermelho
+    "Alerta (queda/ zerada)": "#e74c3c",       # vermelho
     "Investigar": "#f1c40f",            # amarelo
     "Gerenciar (aumento)": "#3498db",   # azul
     "Normal": "#2ecc71",                # verde
@@ -199,7 +199,7 @@ def pct_int_ceil_ratio(var_ratio: float) -> int:
 
 def calc_status(var30: float, *, queda_critica: float, aumento_relevante: float, investigar_abs: float) -> str:
     if var30 <= queda_critica:
-        return "Escalar (queda)"
+        return "Alerta (queda/ zerada)"
     if abs(var30) >= investigar_abs:
         return "Investigar"
     if var30 >= aumento_relevante:
@@ -208,7 +208,7 @@ def calc_status(var30: float, *, queda_critica: float, aumento_relevante: float,
 
 
 def severity_rank(status: str) -> int:
-    if status == "Escalar (queda)":
+    if status == "Alerta (queda/ zerada)":
         return 0
     if status == "Investigar":
         return 1
@@ -220,7 +220,7 @@ def severity_rank(status: str) -> int:
 
 
 def calc_obs(status: str) -> str:
-    if status == "Escalar (queda)":
+    if status == "Alerta (queda/ zerada)":
         return "Queda crítica vs média histórica"
     if status == "Investigar":
         return "Variação relevante vs média histórica"
@@ -602,8 +602,8 @@ def render_status_boxes(df: pd.DataFrame):
         f"""
 <div class="status-row">
   <div class="status-box sb-red">
-    <div class="status-num">{counts["Escalar (queda)"]}</div>
-    <div class="status-lab">Escalar</div>
+    <div class="status-num">{counts["Alerta (queda/ zerada)"]}</div>
+    <div class="status-lab">Alerta</div>
   </div>
   <div class="status-box sb-yellow">
     <div class="status-num">{counts["Investigar"]}</div>
@@ -789,7 +789,7 @@ with k3:
     alerts_count = int((df_checklist["status"] != "Normal").sum()) if not df_checklist.empty else 0
     st.metric("Alertas", fmt_int_pt(alerts_count))
 with k4:
-    critical = int((df_checklist["status"] == "Escalar (queda)").sum()) if not df_checklist.empty else 0
+    critical = int((df_checklist["status"] == "Alerta (queda/ zerada)").sum()) if not df_checklist.empty else 0
     st.metric("Alertas críticos", fmt_int_pt(critical))
 with k5:
     st.metric("Contas com bloqueio", fmt_int_pt(kpi_blocked_accounts))
@@ -849,7 +849,7 @@ if px is not None and go is not None and not df_checklist.empty:
             x="company_name",
             y="var_30d",
             color="sign",
-            color_discrete_map={"pos": STATUS_COLOR["Normal"], "neg": STATUS_COLOR["Escalar (queda)"]},
+            color_discrete_map={"pos": STATUS_COLOR["Normal"], "neg": STATUS_COLOR["Alerta (queda/ zerada)"]},
         )
         fig.update_layout(
             showlegend=False,
