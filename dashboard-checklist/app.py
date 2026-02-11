@@ -1199,7 +1199,7 @@ with tab_bubbles:
     with colA:
         bubble_height = st.slider("Altura do aquário", 520, 900, 700, 20)
     with colB:
-        bubble_scale = st.slider("Tamanho das bolhas", 1.0, 2.5, 1.6, 0.1)
+        bubble_scale = st.slider("Tamanho das bolhas", 20.0, 41.5, 5.6, 0.1)
 
     render_bubble_aquarium(df_nodes, height=int(bubble_height), bubble_scale=float(bubble_scale))
 
