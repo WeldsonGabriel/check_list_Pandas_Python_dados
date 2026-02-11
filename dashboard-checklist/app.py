@@ -1,17 +1,16 @@
 # app.py
-# Streamlit dashboard — Checklist (por CONTA) + Bloqueio (BaaS)
-# Versão: semanas W1..W4 (últimas 4 semanas) + gauge "TOTAL (4 SEMANAS)"
+# Streamlit Dashboard — Checklist (por conta) com Semanas 1–4 (quantidade), BaaS embutido, Ground + Cards,
+# e 3 abas: Principal | Bolhas (Aquário) | Analytics
 #
-# Correções desta versão:
-# ✅ Ground dropdown por CONTA (Empresa + Conta) igual checklist
-# ✅ Conta NÃO abrevia: sempre pega do "Person Name" (prefixo antes do " - ") e mantém como string
-# ✅ BaaS merge por chave numérica (digits-only) para encontrar bloqueios com robustez
-# ✅ KPI label: "Contas com bloqueio"
-# ✅ Sidebar: seletor de altura do Ground (220 / 340 / 480)
+# Ajustes desta versão:
+# ✅ Bolhas maiores e preenchendo melhor o aquário + slider "Tamanho das bolhas"
+# ✅ Substitui "Total 4 semanas por status" por "Top Empresas por Volume (Total 4 semanas)" (empresa-based)
 
 from __future__ import annotations
 
+import io
 import re
+import json
 import math
 from dataclasses import dataclass
 from datetime import timedelta
@@ -20,6 +19,7 @@ from typing import Optional, List, Dict, Tuple
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     from unidecode import unidecode
@@ -35,32 +35,39 @@ except Exception:
 
 
 # =========================
-# Config
+# Page config
 # =========================
-st.set_page_config(page_title="Checklist + Bloqueio (BaaS)", layout="wide")
+st.set_page_config(page_title="Checklist Semanas + Bloqueio (BaaS)", layout="wide")
 
+
+# =========================
+# Status / cores
+# =========================
 STATUS_ORDER = ["Alerta (queda/ zerada)", "Investigar", "Gerenciar (aumento)", "Normal"]
 
 STATUS_COLOR = {
-    "Alerta (queda/ zerada)": "#e74c3c",       # vermelho
-    "Investigar": "#f1c40f",                  # amarelo
-    "Gerenciar (aumento)": "#3498db",         # azul
-    "Normal": "#2ecc71",                      # verde
+    "Alerta (queda/ zerada)": "#e74c3c",  # vermelho
+    "Investigar": "#f1c40f",              # amarelo
+    "Gerenciar (aumento)": "#3498db",     # azul
+    "Normal": "#2ecc71",                  # verde
     "Desconhecido": "#aab4c8",
 }
-
-LOCK_ICON = "🔒"
-UNLOCK_ICON = "🔓"
-UNKNOWN_ICON = "⚪"
 
 STATUS_DOT = {
     "Alerta (queda/ zerada)": "🔴",
     "Investigar": "🟡",
     "Gerenciar (aumento)": "🔵",
     "Normal": "🟢",
-    "Desconhecido": "⚪",
 }
 
+LOCK_ICON = "🔒"
+UNLOCK_ICON = "🔓"
+UNKNOWN_ICON = "⚪"
+
+
+# =========================
+# CSS
+# =========================
 st.markdown(
     """
 <style>
@@ -70,10 +77,9 @@ st.markdown(
   padding: 12px 14px;
   border-radius: 14px;
 }
-
-.mini-grid-6 {
+.mini-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: 1fr 1fr;
   gap: 10px;
   margin-top: 10px;
 }
@@ -84,8 +90,7 @@ st.markdown(
   padding: 12px 14px;
 }
 .mini-title { font-size: 13px; opacity: .75; margin-bottom: 6px; }
-.mini-value { font-size: 26px; font-weight: 800; line-height: 1.1; }
-.mini-sub  { font-size: 12px; opacity: .65; margin-top: 6px; }
+.mini-value { font-size: 22px; font-weight: 800; line-height: 1.1; }
 
 .status-row {
   display: grid;
@@ -121,11 +126,10 @@ class Thresholds:
     queda_critica: float = -0.60
     aumento_relevante: float = 0.80
     investigar_abs: float = 0.30
-    baixo_periodo_limite: int = 1
 
 
 # =========================
-# Normalize helpers
+# Normalização
 # =========================
 SUFFIXES = [
     " LTDA", " LTDA.", " SA", " S.A", " S.A.", " ME", " EPP", " EIRELI", " EI",
@@ -144,24 +148,20 @@ def _strip_accents(s: str) -> str:
 
 def normalize_company(name: str) -> str:
     s = str(name or "").strip()
-    s = _strip_accents(s)
-    s = s.upper()
+    s = _strip_accents(s).upper()
     s = s.replace("\t", " ").replace("\n", " ")
     s = PUNCT_RE.sub(" ", s)
     s = re.sub(r"\s+", " ", s).strip()
-
     for suf in SUFFIXES:
         if s.endswith(suf):
             s = s[: -len(suf)].strip()
-
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def split_companies_input(text: str) -> List[str]:
     raw = re.split(r"[\n,]+", text or "")
-    out = []
-    seen = set()
+    out: List[str] = []
+    seen: set[str] = set()
     for x in raw:
         x = x.strip()
         if not x:
@@ -172,74 +172,6 @@ def split_companies_input(text: str) -> List[str]:
         seen.add(k)
         out.append(k)
     return out
-
-
-def digits_only(s: str) -> str:
-    return re.sub(r"\D+", "", str(s or ""))
-
-
-# =========================
-# Math / status helpers
-# =========================
-def safe_div(n: float, d: float) -> float:
-    if not d:
-        return 0.0
-    return float(n) / float(d)
-
-
-def calc_var(curr: float, ref: float) -> float:
-    try:
-        c = float(curr)
-        r = float(ref)
-    except Exception:
-        return 0.0
-    if r == 0:
-        return 0.0
-    return (c - r) / r
-
-
-def pct_int_ceil_ratio(var_ratio: float) -> int:
-    try:
-        pct = float(var_ratio) * 100.0
-    except Exception:
-        return 0
-    return int(math.ceil(pct))
-
-
-def calc_status(var: float, *, queda_critica: float, aumento_relevante: float, investigar_abs: float) -> str:
-    if var <= queda_critica:
-        return "Alerta (queda/ zerada)"
-    if var >= aumento_relevante:
-        return "Gerenciar (aumento)"
-    if abs(var) >= investigar_abs:
-        return "Investigar"
-    return "Normal"
-
-
-def severity_rank(status: str) -> int:
-    if status == "Alerta (queda/ zerada)":
-        return 0
-    if status == "Investigar":
-        return 1
-    if status == "Gerenciar (aumento)":
-        return 2
-    if status == "Normal":
-        return 3
-    return 9
-
-
-def calc_obs_week(status: str, total_4w: int, baixo_periodo_limite: int) -> str:
-    if total_4w <= 0:
-        return "Conta zerada no período (4 semanas)"
-    if total_4w <= int(baixo_periodo_limite):
-        return "Volume muito baixo no período (4 semanas)"
-    if status == "Alerta (queda/ zerada)":
-        return "Queda crítica vs média das 3 semanas anteriores (W4 vs W1–W3)"
-    if status == "Gerenciar (aumento)":
-        return "Aumento relevante vs média das 3 semanas anteriores (W4 vs W1–W3)"
-    if status == "Investigar":
-        return "Variação relevante vs média das 3 semanas anteriores (W4 vs W1–W3)"
-    return "Dentro do esperado"
 
 
 # =========================
@@ -259,29 +191,105 @@ def fmt_money_pt(x: float) -> str:
     except Exception:
         v = 0.0
     s = f"{v:,.2f}"
-    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
-    return s
+    return s.replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def fmt_pct_int(n: int) -> str:
-    try:
-        v = int(n)
-    except Exception:
-        v = 0
-    return f"{v}%"
-
-
-def fmt_range(d0, d1) -> str:
-    try:
-        a = pd.to_datetime(d0).date()
-        b = pd.to_datetime(d1).date()
-        return f"{a.strftime('%d/%m')}-{b.strftime('%d/%m')}"
-    except Exception:
-        return "—"
+def clamp_int(x: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(x)))
 
 
 # =========================
-# CSV helpers
+# CSV parsing (Transações)
+# =========================
+def _guess_sep(sample: str) -> str:
+    if "\t" in sample:
+        return "\t"
+    if sample.count(";") >= sample.count(","):
+        return ";"
+    return ","
+
+
+def _parse_person(person: str) -> Tuple[str, str]:
+    """
+    "11717 - PIX NA HORA LTDA" -> ("11717", "PIX NA HORA LTDA")
+    """
+    s = str(person or "").strip()
+    if not s:
+        return "", ""
+    if " - " in s:
+        a, b = s.split(" - ", 1)
+        return a.strip(), b.strip()
+    if "-" in s:
+        a, b = s.split("-", 1)
+        return a.strip(), b.strip()
+    return "", s.strip()
+
+
+def parse_transactions_csv(uploaded_file) -> pd.DataFrame:
+    """
+    Interpretação:
+      - credit_raw e debit_raw representam QUANTIDADE de transações (não valor).
+    Saída:
+      date (date), account_id (str), company_name (str), company_key (str),
+      credit_cnt (int), debit_cnt (int), total_cnt (int)
+    """
+    if uploaded_file is None:
+        return pd.DataFrame()
+
+    b = uploaded_file.getvalue()
+    if not b:
+        return pd.DataFrame()
+
+    text = b.decode("utf-8", errors="replace")
+    sep = _guess_sep(text[:4000])
+
+    df_raw = pd.read_csv(io.StringIO(text), sep=sep, engine="python", dtype=str, header=0)
+
+    if df_raw.shape[1] < 5:
+        df_raw = pd.read_csv(io.StringIO(text), sep=sep, engine="python", dtype=str, header=None)
+        if df_raw.shape[1] < 5:
+            return pd.DataFrame()
+        col_date, col_person, col_credit, col_debit = 0, 2, 3, 4
+        date_raw = df_raw.iloc[:, col_date].astype(str)
+        person_raw = df_raw.iloc[:, col_person].astype(str)
+        credit_raw = df_raw.iloc[:, col_credit]
+        debit_raw = df_raw.iloc[:, col_debit]
+    else:
+        date_raw = df_raw.iloc[:, 0].astype(str)
+        person_raw = df_raw.iloc[:, 2].astype(str)
+        credit_raw = df_raw.iloc[:, 3]
+        debit_raw = df_raw.iloc[:, 4]
+
+    dates = pd.to_datetime(date_raw, errors="coerce", dayfirst=True)
+    d = dates.dt.date
+
+    acc_emp = person_raw.apply(_parse_person)
+    account_id = acc_emp.apply(lambda t: t[0]).astype(str).str.strip()
+    company_name = acc_emp.apply(lambda t: t[1]).astype(str).str.strip()
+    company_key = company_name.map(normalize_company)
+
+    credit_cnt = pd.to_numeric(credit_raw, errors="coerce").fillna(0).astype(int)
+    debit_cnt = pd.to_numeric(debit_raw, errors="coerce").fillna(0).astype(int)
+
+    out = pd.DataFrame({
+        "date": d,
+        "account_id": account_id,
+        "company_name": company_name,
+        "company_key": company_key,
+        "credit_cnt": credit_cnt,
+        "debit_cnt": debit_cnt,
+    })
+    out = out.dropna(subset=["date"]).copy()
+    out = out[out["company_key"].astype(str).str.len() > 0].copy()
+    out["account_id"] = out["account_id"].astype(str)
+    out = out[out["account_id"].str.len() > 0].copy()
+
+    out["total_cnt"] = out["credit_cnt"] + out["debit_cnt"]
+    return out
+
+
+# =========================
+# CSV parsing (BaaS)
 # =========================
 def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols = list(df.columns)
@@ -293,279 +301,231 @@ def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     return None
 
 
-def parse_transactions_csv(uploaded_file) -> pd.DataFrame:
-    """
-    CREDIT/DEBIT = quantidade (int)
-    account_id = SEMPRE vem do "Person Name" (prefixo antes do ' - ')
-    """
-    if uploaded_file is None:
-        return pd.DataFrame()
-
-    content = uploaded_file.getvalue()
-    if not content:
-        return pd.DataFrame()
-
-    try:
-        df = pd.read_csv(uploaded_file, sep=None, engine="python")
-    except Exception:
-        uploaded_file.seek(0)
-        try:
-            df = pd.read_csv(uploaded_file, sep=";", engine="python")
-        except Exception:
-            uploaded_file.seek(0)
-            df = pd.read_csv(uploaded_file, sep=",", engine="python")
-
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    date_col = _pick_col(df, ["data", "date", "transac", "day"])
-    person_col = _pick_col(df, ["person"])
-    credit_col = _pick_col(df, ["credit"])
-    debit_col = _pick_col(df, ["debit"])
-
-    if any(x is None for x in [date_col, person_col, credit_col, debit_col]):
-        cols = list(df.columns)
-        if len(cols) >= 5:
-            date_col = date_col or cols[0]
-            person_col = person_col or cols[2]
-            credit_col = credit_col or cols[3]
-            debit_col = debit_col or cols[4]
-
-    if not all([date_col, person_col, credit_col, debit_col]):
-        raise ValueError(
-            f"CSV transações: não identifiquei colunas mínimas. "
-            f"date={date_col}, person={person_col}, credit={credit_col}, debit={debit_col}."
-        )
-
-    work = df[[date_col, person_col, credit_col, debit_col]].copy()
-    work["date"] = pd.to_datetime(work[date_col], errors="coerce", dayfirst=True).dt.date
-
-    person = work[person_col].astype(str).fillna("")
-    parts = person.str.split(" - ", n=1, expand=True)
-
-    # conta COMPLETA vem do prefixo do person name (ex: "11058 - ...")
-    acc_raw = parts[0].fillna("").astype(str).str.strip()
-    acc_full = acc_raw.map(digits_only)  # mantém como string, preserva dígitos
-
-    comp = (parts[1] if parts.shape[1] > 1 else "").fillna("").astype(str).str.strip()
-    comp = np.where(comp == "", person, comp)
-
-    credit = pd.to_numeric(work[credit_col], errors="coerce").fillna(0).astype(int)
-    debit = pd.to_numeric(work[debit_col], errors="coerce").fillna(0).astype(int)
-
-    out = pd.DataFrame({
-        "date": work["date"],
-        "account_id": acc_full.astype("string"),
-        "company_name": pd.Series(comp).astype(str),
-        "credit_un": credit.astype(int),
-        "debit_un": debit.astype(int),
-    })
-
-    out = out.dropna(subset=["date"]).copy()
-    out = out[out["account_id"].astype(str).str.len() > 0].copy()  # precisa ter conta completa
-
-    out["company_key"] = out["company_name"].apply(normalize_company)
-    out["total_un"] = (out["credit_un"] + out["debit_un"]).astype(int)
-
-    # chave para join BaaS
-    out["account_key"] = out["account_id"].astype(str).map(digits_only)
-
-    return out[["date", "account_id", "account_key", "company_name", "company_key", "credit_un", "debit_un", "total_un"]].copy()
-
-
 def parse_baas_csv(uploaded_file) -> pd.DataFrame:
+    """
+    Saída: conta (str), saldo_bloqueado (float)
+    """
     if uploaded_file is None:
         return pd.DataFrame()
-    content = uploaded_file.getvalue()
-    if not content:
+
+    b = uploaded_file.getvalue()
+    if not b:
         return pd.DataFrame()
 
     try:
-        df = pd.read_csv(uploaded_file, sep=None, engine="python")
+        df = pd.read_csv(uploaded_file, sep=None, engine="python", dtype=str)
     except Exception:
         uploaded_file.seek(0)
-        try:
-            df = pd.read_csv(uploaded_file, sep=";", engine="python")
-        except Exception:
-            uploaded_file.seek(0)
-            df = pd.read_csv(uploaded_file, sep=",", engine="python")
+        df = pd.read_csv(uploaded_file, sep=";", engine="python", dtype=str)
 
     if df is None or df.empty:
         return pd.DataFrame()
 
     conta_col = _pick_col(df, ["conta", "account"])
-    bloqueado_col = _pick_col(df, ["bloquead", "saldo bloqueado", "saldo_bloqueado", "blocked"])
+    bloq_col = _pick_col(df, ["saldo bloque", "saldo_bloque", "bloquead", "blocked"])
 
-    if not conta_col or not bloqueado_col:
-        cols = list(df.columns)
-        if len(cols) >= 7:
-            conta_col = conta_col or cols[1]
-            bloqueado_col = bloqueado_col or cols[6]
+    if not conta_col or not bloq_col:
+        if df.shape[1] >= 7:
+            conta_col = conta_col or df.columns[1]
+            bloq_col = bloq_col or df.columns[6]
+        else:
+            return pd.DataFrame()
 
-    if not conta_col or not bloqueado_col:
-        raise ValueError(
-            f"CSV BaaS: colunas não identificadas. conta={conta_col}, bloqueado={bloqueado_col}"
-        )
-
-    work = df[[conta_col, bloqueado_col]].copy()
-    work = work.rename(columns={conta_col: "conta", bloqueado_col: "saldo_bloqueado"})
-    work["conta"] = work["conta"].astype(str).str.strip()
-    work["conta_key"] = work["conta"].map(digits_only)
-    work["saldo_bloqueado"] = pd.to_numeric(work["saldo_bloqueado"], errors="coerce").fillna(0.0).astype(float)
-    return work[["conta", "conta_key", "saldo_bloqueado"]]
+    out = pd.DataFrame()
+    out["conta"] = df[conta_col].fillna("").astype(str).str.strip().str.replace(r"\D+", "", regex=True)
+    out["saldo_bloqueado"] = pd.to_numeric(df[bloq_col], errors="coerce").fillna(0.0).astype(float)
+    out = out[out["conta"].str.len() > 0].copy()
+    out = out.groupby("conta", as_index=False)["saldo_bloqueado"].sum()
+    return out
 
 
 # =========================
-# Week windows
+# Janela de semanas (28d terminando em D-1)
 # =========================
-def week_windows(day_ref) -> List[Tuple[str, object, object]]:
-    dr = pd.to_datetime(day_ref).date()
-    out = []
-    for i in range(4, 0, -1):
-        start = dr - timedelta(days=(i * 7) - 1)
-        end = dr - timedelta(days=((i - 1) * 7))
-        wname = f"W{5 - i}"
-        out.append((wname, start, end))
-    return out  # W1..W4
+def compute_week_ranges(day_ref: pd.Timestamp) -> Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]:
+    d1 = (pd.to_datetime(day_ref) - timedelta(days=1)).normalize()
+    start = d1 - timedelta(days=27)
+    w1 = (start, start + timedelta(days=6))
+    w2 = (start + timedelta(days=7), start + timedelta(days=13))
+    w3 = (start + timedelta(days=14), start + timedelta(days=20))
+    w4 = (start + timedelta(days=21), d1)
+    return {"w1": w1, "w2": w2, "w3": w3, "w4": w4}
 
 
-def sum_in_range(df: pd.DataFrame, start, end, col: str) -> int:
-    m = (df["date"] >= start) & (df["date"] <= end)
-    if df.loc[m].empty:
+# =========================
+# Status por volume semanal
+# =========================
+def calc_status_volume(
+    week4: int,
+    avg_prev: float,
+    total_4w: int,
+    *,
+    thresholds: Thresholds,
+    low_volume_threshold: int,
+) -> Tuple[str, str, float]:
+    if total_4w <= 0:
+        return "Alerta (queda/ zerada)", "Conta zerada no período", 0.0
+
+    if total_4w <= int(low_volume_threshold):
+        return "Investigar", "Volume muito baixo no período", 0.0
+
+    if avg_prev <= 0:
+        return "Normal", "Dentro do esperado", 0.0
+
+    var = (float(week4) - float(avg_prev)) / float(avg_prev)
+
+    if var <= thresholds.queda_critica:
+        return "Alerta (queda/ zerada)", "Queda crítica vs período anterior", var
+
+    if var >= thresholds.investigar_abs:
+        return "Gerenciar (aumento)", "Aumento relevante vs período anterior", var
+
+    if var <= -thresholds.investigar_abs:
+        return "Investigar", "Queda relevante vs período anterior", var
+
+    return "Normal", "Dentro do esperado", var
+
+
+def severity_rank(status: str) -> int:
+    if status == "Alerta (queda/ zerada)":
         return 0
-    return int(df.loc[m, col].sum())
+    if status == "Investigar":
+        return 1
+    if status == "Gerenciar (aumento)":
+        return 2
+    if status == "Normal":
+        return 3
+    return 9
 
 
 # =========================
-# Build checklist per account (weeks)
+# Build checklist (por conta)
 # =========================
-def build_checklist_per_account_weeks(
+def build_checklist_weeks(
     facts: pd.DataFrame,
     companies_keys: List[str],
     thresholds: Thresholds,
-) -> Tuple[str, pd.DataFrame, Dict]:
-    if facts.empty:
+    low_volume_threshold: int,
+) -> Tuple[str, pd.DataFrame, Dict[str, str]]:
+    if facts is None or facts.empty:
         return "", pd.DataFrame(), {}
 
     facts = facts[facts["company_key"].isin(set(companies_keys))].copy()
     if facts.empty:
         return "", pd.DataFrame(), {}
 
-    day_ref = max(facts["date"])
-    day_ref = pd.to_datetime(day_ref).date()
+    day_ref = pd.to_datetime(facts["date"].max())
+    ranges = compute_week_ranges(day_ref)
 
-    base = (
-        facts.groupby(["account_id", "account_key", "company_key", "company_name", "date"], as_index=False)
-        .agg(credit_un=("credit_un", "sum"), debit_un=("debit_un", "sum"), total_un=("total_un", "sum"))
-    )
+    labels = {
+        "w1": f"{ranges['w1'][0].date().isoformat()} → {ranges['w1'][1].date().isoformat()}",
+        "w2": f"{ranges['w2'][0].date().isoformat()} → {ranges['w2'][1].date().isoformat()}",
+        "w3": f"{ranges['w3'][0].date().isoformat()} → {ranges['w3'][1].date().isoformat()}",
+        "w4": f"{ranges['w4'][0].date().isoformat()} → {ranges['w4'][1].date().isoformat()}",
+    }
 
-    wins = week_windows(day_ref)
-    w_meta = {w: (a, b) for (w, a, b) in wins}
+    facts["date_dt"] = pd.to_datetime(facts["date"]).dt.normalize()
 
-    dims = base[["account_id", "account_key", "company_key", "company_name"]].drop_duplicates().copy()
+    def sum_week(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+        m = (df["date_dt"] >= start) & (df["date_dt"] <= end)
+        return df.loc[m].groupby(["account_id", "company_key"], as_index=False)["total_cnt"].sum().set_index(["account_id", "company_key"])["total_cnt"]
+
+    dims = facts[["account_id", "company_key", "company_name"]].drop_duplicates().copy()
+    dims["account_id"] = dims["account_id"].astype(str)
+
+    s_w1 = sum_week(facts, ranges["w1"][0], ranges["w1"][1])
+    s_w2 = sum_week(facts, ranges["w2"][0], ranges["w2"][1])
+    s_w3 = sum_week(facts, ranges["w3"][0], ranges["w3"][1])
+    s_w4 = sum_week(facts, ranges["w4"][0], ranges["w4"][1])
+
+    start_all = ranges["w1"][0]
+    end_all = ranges["w4"][1]
+    m_all = (facts["date_dt"] >= start_all) & (facts["date_dt"] <= end_all)
+    period = facts.loc[m_all].groupby(["account_id", "company_key"], as_index=False).agg(
+        credit=("credit_cnt", "sum"),
+        debit=("debit_cnt", "sum"),
+        total_4w=("total_cnt", "sum"),
+    ).set_index(["account_id", "company_key"])
+
     rows: List[Dict] = []
+    for _, r in dims.iterrows():
+        acc = str(r["account_id"])
+        ck = str(r["company_key"])
+        name = str(r["company_name"])
 
-    for _, d in dims.iterrows():
-        account_id = str(d["account_id"])
-        account_key = str(d["account_key"])
-        company_key = str(d["company_key"])
-        company_name = str(d["company_name"])
+        key = (acc, ck)
+        w1 = int(s_w1.get(key, 0))
+        w2 = int(s_w2.get(key, 0))
+        w3 = int(s_w3.get(key, 0))
+        w4 = int(s_w4.get(key, 0))
 
-        scope = base[(base["account_key"].astype(str) == account_key) & (base["company_key"] == company_key)].copy()
-        if scope.empty:
-            continue
+        credit = int(period.loc[key, "credit"]) if key in period.index else 0
+        debit = int(period.loc[key, "debit"]) if key in period.index else 0
+        total_4w = int(period.loc[key, "total_4w"]) if key in period.index else (w1 + w2 + w3 + w4)
 
-        w_totals = {}
-        for (w, a, b) in wins:
-            w_totals[w] = {
-                "total": sum_in_range(scope, a, b, "total_un"),
-                "credit": sum_in_range(scope, a, b, "credit_un"),
-                "debit": sum_in_range(scope, a, b, "debit_un"),
-                "range": fmt_range(a, b),
-            }
-
-        w1 = w_totals["W1"]["total"]
-        w2 = w_totals["W2"]["total"]
-        w3 = w_totals["W3"]["total"]
-        w4 = w_totals["W4"]["total"]
-
-        total_4w = int(w1 + w2 + w3 + w4)
-        credit_4w = int(w_totals["W1"]["credit"] + w_totals["W2"]["credit"] + w_totals["W3"]["credit"] + w_totals["W4"]["credit"])
-        debit_4w = int(w_totals["W1"]["debit"] + w_totals["W2"]["debit"] + w_totals["W3"]["debit"] + w_totals["W4"]["debit"])
-
-        ref_mean = safe_div((w1 + w2 + w3), 3)
-        var_w4 = calc_var(w4, ref_mean)
-        var_w4_pct = pct_int_ceil_ratio(var_w4)
-
-        status = calc_status(
-            var_w4,
-            queda_critica=thresholds.queda_critica,
-            aumento_relevante=thresholds.aumento_relevante,
-            investigar_abs=thresholds.investigar_abs,
+        avg_prev = (w1 + w2 + w3) / 3.0
+        status, motivo, var = calc_status_volume(
+            week4=w4,
+            avg_prev=avg_prev,
+            total_4w=total_4w,
+            thresholds=thresholds,
+            low_volume_threshold=low_volume_threshold,
         )
-        obs = calc_obs_week(status, total_4w=total_4w, baixo_periodo_limite=thresholds.baixo_periodo_limite)
 
         rows.append({
-            "company_key": company_key,
-            "company_name": company_name,
-            "account_id": account_id,       # EXIBIÇÃO (completo)
-            "account_key": account_key,     # JOIN BaaS
-            "day_ref": day_ref.isoformat(),
+            "company_key": ck,
+            "company_name": name,
+            "account_id": acc,
+            "day_ref": day_ref.date().isoformat(),
 
-            "w1": int(w1), "w2": int(w2), "w3": int(w3), "w4": int(w4),
-            "w1_range": w_totals["W1"]["range"],
-            "w2_range": w_totals["W2"]["range"],
-            "w3_range": w_totals["W3"]["range"],
-            "w4_range": w_totals["W4"]["range"],
+            "week1": w1,
+            "week2": w2,
+            "week3": w3,
+            "week4": w4,
 
-            "credit_4w": int(credit_4w),
-            "debit_4w": int(debit_4w),
-            "total_4w": int(total_4w),
+            "credit": credit,
+            "debit": debit,
+            "total_4w": total_4w,
 
-            "ref_mean_w1w3": float(ref_mean),
-            "var_w4": float(var_w4),
-            "var_w4_pct": int(var_w4_pct),
+            "avg_prev_weeks": float(avg_prev),
+            "var_week4_vs_prev": float(var),
 
             "status": status,
-            "obs": obs,
+            "motivo": motivo,
             "severity": severity_rank(status),
         })
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return day_ref.isoformat(), df, w_meta
+        return day_ref.date().isoformat(), df, labels
 
+    df = df[df["total_4w"] > 0].copy()
     df = df.sort_values(["severity", "company_name", "account_id"], ascending=[True, True, True]).reset_index(drop=True)
-    return day_ref.isoformat(), df, w_meta
+    return day_ref.date().isoformat(), df, labels
 
 
 # =========================
-# Enrich BaaS (por conta) — JOIN POR account_key
+# Enrich BaaS (por conta)
 # =========================
-def enrich_with_baas_accounts(
-    df_checklist: pd.DataFrame,
-    df_baas: pd.DataFrame,
-) -> Tuple[pd.DataFrame, int, float]:
+def enrich_baas(df_checklist: pd.DataFrame, df_baas: pd.DataFrame) -> Tuple[pd.DataFrame, int, float]:
     out = df_checklist.copy()
-    out["account_id"] = out["account_id"].astype(str).str.strip()
-    out["account_key"] = out["account_key"].astype(str).map(digits_only)
+    if out.empty:
+        return out, 0, 0.0
 
-    if df_baas is None or df_baas.empty or out.empty:
+    out["account_id"] = out["account_id"].astype(str).str.strip().str.replace(r"\D+", "", regex=True)
+
+    if df_baas is None or df_baas.empty:
         out["saldo_bloqueado_total"] = 0.0
         out["has_block"] = False
-        out["lock_icon"] = UNLOCK_ICON if not out.empty else UNKNOWN_ICON
+        out["lock_icon"] = UNLOCK_ICON
         return out, 0, 0.0
 
     baas = df_baas.copy()
-    baas["conta_key"] = baas["conta_key"].astype(str).map(digits_only)
+    baas["conta"] = baas["conta"].astype(str).str.strip().str.replace(r"\D+", "", regex=True)
     baas["saldo_bloqueado"] = pd.to_numeric(baas["saldo_bloqueado"], errors="coerce").fillna(0.0).astype(float)
+    baas = baas.rename(columns={"conta": "account_id", "saldo_bloqueado": "saldo_bloqueado_total"})
 
-    baas_agg = (
-        baas.groupby("conta_key", as_index=False)["saldo_bloqueado"].sum()
-        .rename(columns={"conta_key": "account_key", "saldo_bloqueado": "saldo_bloqueado_total"})
-    )
-
-    merged = out.merge(baas_agg, on="account_key", how="left")
+    merged = out.merge(baas, on="account_id", how="left")
     merged["saldo_bloqueado_total"] = pd.to_numeric(merged["saldo_bloqueado_total"], errors="coerce").fillna(0.0).astype(float)
 
     merged["has_block"] = merged["saldo_bloqueado_total"] > 0
@@ -593,15 +553,13 @@ def slice_page(df: pd.DataFrame, page: int, page_size: int) -> pd.DataFrame:
 
 
 # =========================
-# UI blocks
+# UI helpers
 # =========================
 def render_status_boxes(df: pd.DataFrame):
     if df is None or df.empty:
         st.info("Sem dados.")
         return
-
     counts = {s: int((df["status"] == s).sum()) for s in STATUS_ORDER}
-
     st.markdown(
         f"""
 <div class="status-row">
@@ -627,19 +585,20 @@ def render_status_boxes(df: pd.DataFrame):
     )
 
 
-def render_gauge_and_week_cards(
+def render_ground_panel(
     title: str,
     w1: int, w2: int, w3: int, w4: int,
-    w1_range: str, w2_range: str, w3_range: str, w4_range: str,
-    var_w4_pct: int,
-    total_4w: int,
+    credit: int, debit: int, total_4w: int,
+    var: float,
     height: int,
+    labels: Dict[str, str],
 ):
     if go is None:
         st.warning("plotly não está disponível (instale plotly).")
         return
 
-    gauge_max = max(total_4w * 1.15, 1.0)
+    max_ref = max(total_4w, w1, w2, w3, w4, 1)
+    gauge_max = max_ref * 1.25
 
     fig = go.Figure(
         go.Indicator(
@@ -649,7 +608,7 @@ def render_gauge_and_week_cards(
             title={"text": title},
             gauge={
                 "axis": {"range": [0, gauge_max]},
-                "bar": {"color": STATUS_COLOR["Gerenciar (aumento)"]},
+                "bar": {"color": "rgba(255,255,255,0.85)"},
                 "bgcolor": "rgba(0,0,0,0)",
                 "borderwidth": 0,
                 "steps": [{"range": [0, gauge_max], "color": "rgba(255,255,255,0.08)"}],
@@ -657,49 +616,52 @@ def render_gauge_and_week_cards(
         )
     )
     fig.update_layout(
-        height=int(height),
-        margin=dict(l=10, r=10, t=60, b=10),
+        height=height,
+        margin=dict(l=10, r=10, t=70, b=10),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color="rgba(255,255,255,0.90)"),
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    st.caption(f"W1 {w1_range} | W2 {w2_range} | W3 {w3_range} | W4 {w4_range}")
-
+    var_pct = int(math.ceil(var * 100.0)) if np.isfinite(var) else 0
     st.markdown(
         f"""
-<div class="mini-grid-6">
+<div class="mini-grid">
   <div class="mini-card">
-    <div class="mini-title">Semana 1</div>
+    <div class="mini-title">Semana 1 ({labels.get("w1","")})</div>
     <div class="mini-value">{fmt_int_pt(w1)}</div>
-    <div class="mini-sub">{w1_range}</div>
   </div>
   <div class="mini-card">
-    <div class="mini-title">Semana 2</div>
+    <div class="mini-title">Semana 2 ({labels.get("w2","")})</div>
     <div class="mini-value">{fmt_int_pt(w2)}</div>
-    <div class="mini-sub">{w2_range}</div>
-  </div>
-  <div class="mini-card">
-    <div class="mini-title">Semana 3</div>
-    <div class="mini-value">{fmt_int_pt(w3)}</div>
-    <div class="mini-sub">{w3_range}</div>
   </div>
 
   <div class="mini-card">
-    <div class="mini-title">Semana 4</div>
+    <div class="mini-title">Semana 3 ({labels.get("w3","")})</div>
+    <div class="mini-value">{fmt_int_pt(w3)}</div>
+  </div>
+  <div class="mini-card">
+    <div class="mini-title">Semana 4 ({labels.get("w4","")})</div>
     <div class="mini-value">{fmt_int_pt(w4)}</div>
-    <div class="mini-sub">{w4_range}</div>
+  </div>
+
+  <div class="mini-card">
+    <div class="mini-title">Crédito (Qtd)</div>
+    <div class="mini-value">{fmt_int_pt(credit)}</div>
   </div>
   <div class="mini-card">
-    <div class="mini-title">Variação (W4 vs média W1–W3)</div>
-    <div class="mini-value">{fmt_pct_int(var_w4_pct)}</div>
-    <div class="mini-sub">comparação de volume</div>
+    <div class="mini-title">Débito (Qtd)</div>
+    <div class="mini-value">{fmt_int_pt(debit)}</div>
+  </div>
+
+  <div class="mini-card">
+    <div class="mini-title">Variação (S4 vs média S1–S3)</div>
+    <div class="mini-value">{var_pct}%</div>
   </div>
   <div class="mini-card">
-    <div class="mini-title">Total (4 semanas)</div>
+    <div class="mini-title">Total 4 Semanas</div>
     <div class="mini-value">{fmt_int_pt(total_4w)}</div>
-    <div class="mini-sub">W1+W2+W3+W4</div>
   </div>
 </div>
 """,
@@ -708,288 +670,626 @@ def render_gauge_and_week_cards(
 
 
 # =========================
-# APP UI
+# Bubble aquarium (D3) — agora com "bubble_scale"
 # =========================
-st.title("Alertas (Checklist por conta) + Bloqueio (BaaS) — Semanas W1..W4")
+def render_bubble_aquarium(df_nodes: pd.DataFrame, height: int = 700, bubble_scale: float = 1.6):
+    if df_nodes is None or df_nodes.empty:
+        st.info("Sem dados para bolhas.")
+        return
+
+    df_nodes = df_nodes.copy()
+
+    # evita travar com muitos nós
+    if len(df_nodes) > 600:
+        df_nodes = df_nodes.nlargest(600, "value")
+
+    df_nodes["value"] = pd.to_numeric(df_nodes["value"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    if df_nodes["value"].max() <= 0:
+        df_nodes["value"] = 1.0
+
+    nodes = df_nodes.to_dict(orient="records")
+    nodes_json = json.dumps(nodes, ensure_ascii=False)
+
+    colors_json = json.dumps(STATUS_COLOR, ensure_ascii=False)
+    bubble_scale = float(bubble_scale)
+
+    html = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+  html, body {{ margin:0; padding:0; background:transparent; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; }}
+  #wrap {{
+    width: 100%;
+    height: {height}px;
+    position: relative;
+    border-radius: 16px;
+    overflow: hidden;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.08);
+  }}
+  .tooltip {{
+    position: absolute;
+    pointer-events: none;
+    opacity: 0;
+    background: rgba(15, 15, 18, 0.96);
+    color: #fff;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.10);
+    box-shadow: 0 10px 30px rgba(0,0,0,.35);
+    font-size: 12px;
+    max-width: 420px;
+    line-height: 1.35;
+    z-index: 9999;
+  }}
+  .t-title {{ font-weight: 800; font-size: 13px; margin-bottom: 6px; }}
+  .t-row {{ opacity: .92; }}
+  .legend {{
+    position:absolute;
+    left: 12px;
+    bottom: 12px;
+    display:flex;
+    gap: 10px;
+    flex-wrap:wrap;
+    background: rgba(0,0,0,0.20);
+    border: 1px solid rgba(255,255,255,0.08);
+    padding: 8px 10px;
+    border-radius: 14px;
+    backdrop-filter: blur(6px);
+  }}
+  .leg-item {{ display:flex; align-items:center; gap:6px; font-size: 12px; opacity:.92; }}
+  .dot {{ width:10px; height:10px; border-radius:999px; }}
+  .hint {{
+    position:absolute;
+    right:12px;
+    top:12px;
+    background: rgba(0,0,0,0.20);
+    border: 1px solid rgba(255,255,255,0.08);
+    padding: 8px 10px;
+    border-radius: 14px;
+    font-size: 12px;
+    opacity:.92;
+    backdrop-filter: blur(6px);
+  }}
+</style>
+</head>
+<body>
+<div id="wrap"></div>
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+  const nodes = {nodes_json};
+  const COLORS = {colors_json};
+  const SCALE = {bubble_scale};
+
+  const wrap = document.getElementById("wrap");
+  const tooltip = document.getElementById("tooltip");
+
+  const W = wrap.clientWidth;
+  const H = wrap.clientHeight;
+  const minSide = Math.max(240, Math.min(W, H));
+
+  const svg = d3.select("#wrap").append("svg")
+    .attr("width", W)
+    .attr("height", H);
+
+  // Raio: baseado no tamanho do aquário -> bolhas maiores e ocupando melhor
+  const valueExtent = d3.extent(nodes, d => +d.value);
+
+  const baseMin = Math.max(14, minSide * 0.035);
+  const baseMax = Math.max(46, minSide * 0.16);
+
+  const rMin = Math.min(40, baseMin * SCALE);
+  const rMax = Math.min(120, baseMax * SCALE);
+
+  const rScale = d3.scaleSqrt()
+    .domain(valueExtent[0] === valueExtent[1] ? [0, valueExtent[1] || 1] : valueExtent)
+    .range([rMin, rMax]);
+
+  const padding = 2;
+
+  nodes.forEach(d => {{
+    d.r = rScale(+d.value || 0);
+    d.x = W/2 + (Math.random() - 0.5) * 80;
+    d.y = H/2 + (Math.random() - 0.5) * 80;
+  }});
+
+  const circles = svg.selectAll("circle")
+    .data(nodes, d => d.id)
+    .join("circle")
+    .attr("r", d => d.r)
+    .attr("cx", d => d.x)
+    .attr("cy", d => d.y)
+    .attr("fill", d => COLORS[d.status] || "#aab4c8")
+    .attr("fill-opacity", 0.80)
+    .attr("stroke", d => d.blocked ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.25)")
+    .attr("stroke-width", d => d.blocked ? 2.2 : 1.0);
+
+  circles
+    .on("mousemove", (event, d) => {{
+      const b = d.blocked ? "🔒 BLOQUEIO" : "🔓 sem bloqueio";
+      tooltip.innerHTML = `
+        <div class="t-title">${{d.company}} | Conta ${{d.label}}</div>
+        <div class="t-row">Status: <b>${{d.status}}</b></div>
+        <div class="t-row">Total 4 semanas: <b>${{d.value}}</b></div>
+        <div class="t-row">Semana 1: <b>${{d.w1}}</b> | Semana 2: <b>${{d.w2}}</b></div>
+        <div class="t-row">Semana 3: <b>${{d.w3}}</b> | Semana 4: <b>${{d.w4}}</b></div>
+        <div class="t-row">Bloqueio: <b>${{b}}</b> (${{
+          d.blocked_value != null ? d.blocked_value : 0
+        }})</div>
+      `;
+      tooltip.style.opacity = 1;
+      tooltip.style.left = (event.pageX + 14) + "px";
+      tooltip.style.top = (event.pageY + 14) + "px";
+
+      d3.select(event.currentTarget)
+        .attr("fill-opacity", 0.95)
+        .attr("stroke", "rgba(255,255,255,0.95)")
+        .attr("stroke-width", 2.6);
+    }})
+    .on("mouseleave", (event, d) => {{
+      tooltip.style.opacity = 0;
+      d3.select(event.currentTarget)
+        .attr("fill-opacity", 0.80)
+        .attr("stroke", d.blocked ? "rgba(255,255,255,0.95)" : "rgba(255,255,255,0.25)")
+        .attr("stroke-width", d.blocked ? 2.2 : 1.0);
+    }});
+
+  // Forças ajustadas: menos repulsão + colisão forte => “preenche” melhor o aquário
+  const sim = d3.forceSimulation(nodes)
+    .velocityDecay(0.18)
+    .force("charge", d3.forceManyBody().strength(-6))
+    .force("center", d3.forceCenter(W/2, H/2))
+    .force("collision", d3.forceCollide().radius(d => d.r + 3).iterations(3))
+    .force("x", d3.forceX(W/2).strength(0.06))
+    .force("y", d3.forceY(H/2).strength(0.06));
+
+  // Clamp para garantir que ficam "certinho dentro do aquário"
+  sim.on("tick", () => {{
+    nodes.forEach(d => {{
+      d.x = Math.max(d.r + padding, Math.min(W - d.r - padding, d.x));
+      d.y = Math.max(d.r + padding, Math.min(H - d.r - padding, d.y));
+    }});
+    circles.attr("cx", d => d.x).attr("cy", d => d.y);
+  }});
+
+  const legend = d3.select("#wrap").append("div").attr("class","legend");
+  const items = [
+    ["Alerta (queda/ zerada)", COLORS["Alerta (queda/ zerada)"]],
+    ["Investigar", COLORS["Investigar"]],
+    ["Gerenciar (aumento)", COLORS["Gerenciar (aumento)"]],
+    ["Normal", COLORS["Normal"]],
+  ];
+  items.forEach(([name, c]) => {{
+    const it = legend.append("div").attr("class","leg-item");
+    it.append("div").attr("class","dot").style("background", c);
+    it.append("div").text(name);
+  }});
+
+  d3.select("#wrap").append("div")
+    .attr("class","hint")
+    .html("Passe o mouse nas bolhas • Tamanho = Total 4 semanas • Borda branca = bloqueio");
+</script>
+</body>
+</html>
+"""
+    components.html(html, height=height + 12, scrolling=False)
+
+
+# =========================
+# App
+# =========================
+st.title("Checklist (Semanas 1–4) + Bloqueio (BaaS)")
 
 with st.sidebar:
-    st.header("Parâmetros (status)")
-    queda_critica = st.number_input("Queda crítica (W4 vs média W1–W3)", value=-0.60, step=0.01, format="%.2f")
-    aumento_relevante = st.number_input("Aumento relevante (W4 vs média W1–W3)", value=0.80, step=0.01, format="%.2f")
-    investigar_abs = st.number_input("Investigar abs (>= 30%)", value=0.30, step=0.01, format="%.2f")
+    st.header("Parâmetros (Status)")
+    queda_critica = st.number_input("Queda crítica (S4 vs média S1–S3)", value=-0.60, step=0.01, format="%.2f")
+    aumento_relevante = st.number_input("Aumento relevante (não essencial)", value=0.80, step=0.01, format="%.2f")
+    investigar_abs = st.number_input("Faixa normal (±)", value=0.30, step=0.01, format="%.2f")
 
     st.divider()
-    st.header("Baixo volume no período")
-    baixo_periodo_limite = st.number_input("Volume muito baixo (<=)", value=1, step=1, min_value=0)
+    st.header("Volume muito baixo")
+    low_volume_threshold = st.number_input("Limite (Total 4 semanas)", value=5, step=1, min_value=0)
 
     st.divider()
-    st.header("Ground (altura)")
-    ground_height = st.select_slider("Altura do Ground", options=[220, 340, 480], value=340)
+    st.header("Ground (tamanho)")
+    ground_height = st.slider("Altura do Ground", min_value=220, max_value=480, value=340, step=20)
 
     st.divider()
     st.header("Paginação")
-    page_size_checklist = st.selectbox("Checklist (por página)", [15, 20, 30, 50], index=0)
+    page_size = st.selectbox("Checklist (por página)", [15, 20, 30, 50], index=0)
 
 thresholds = Thresholds(
     queda_critica=float(queda_critica),
     aumento_relevante=float(aumento_relevante),
     investigar_abs=float(investigar_abs),
-    baixo_periodo_limite=int(baixo_periodo_limite),
 )
 
-col_left, col_right = st.columns([1.2, 1.0], gap="large")
+tab_main, tab_bubbles, tab_analytics = st.tabs(["Principal", "Bolhas (Aquário)", "Analytics"])
 
-with col_left:
-    companies_text = st.text_area(
-        "Empresas (obrigatório) — vírgula ou uma por linha",
-        height=140,
-        placeholder="Ex:\nDOM DIGITAL\nPIX NA HORA LTDA",
-        key="companies_text",
-    )
+# =========================
+# PRINCIPAL
+# =========================
+with tab_main:
+    col_left, col_right = st.columns([1.2, 1.0], gap="large")
 
-with col_right:
-    trans_file = st.file_uploader("CSV Transações (obrigatório)", type=["csv"], key="trans_csv")
-    baas_file = st.file_uploader("CSV BaaS (opcional)", type=["csv"], key="baas_csv")
+    with col_left:
+        companies_text = st.text_area(
+            "Empresas (obrigatório) — vírgula ou uma por linha",
+            height=140,
+            placeholder="Ex:\nDOM DIGITAL\nPIX NA HORA LTDA",
+            key="companies_text",
+        )
 
-process = st.button("Processar", type="primary", use_container_width=True)
+    with col_right:
+        trans_file = st.file_uploader("CSV Transações (obrigatório)", type=["csv"], key="trans_csv")
+        baas_file = st.file_uploader("CSV BaaS (opcional)", type=["csv"], key="baas_csv")
 
-if process:
-    companies_keys = split_companies_input(companies_text)
-    if not companies_keys:
-        st.error("Você precisa informar pelo menos 1 empresa no input antes de processar.")
-        st.stop()
-    if trans_file is None:
-        st.error("Você precisa subir o CSV de transações antes de processar.")
-        st.stop()
+    process = st.button("Processar", type="primary", use_container_width=True)
 
-    with st.spinner("Lendo CSVs e calculando checklist por conta (W1..W4)..."):
-        facts = parse_transactions_csv(trans_file)
-        if facts.empty:
-            st.error("O CSV de transações ficou vazio após normalização (datas/contas inválidas).")
+    if process:
+        companies_keys = split_companies_input(companies_text)
+        if not companies_keys:
+            st.error("Você precisa informar pelo menos 1 empresa no input antes de processar.")
+            st.stop()
+        if trans_file is None:
+            st.error("Você precisa subir o CSV de transações antes de processar.")
             st.stop()
 
-        day_ref, df_checklist, w_meta = build_checklist_per_account_weeks(facts, companies_keys, thresholds)
+        with st.spinner("Processando..."):
+            facts = parse_transactions_csv(trans_file)
+            if facts.empty:
+                st.error("CSV de transações ficou vazio após leitura/normalização.")
+                st.stop()
 
-        if df_checklist.empty:
-            st.warning("Nenhuma conta encontrada para as empresas filtradas.")
-            st.session_state["day_ref"] = day_ref
-            st.session_state["df_checklist"] = df_checklist
-            st.session_state["w_meta"] = w_meta
-        else:
+            day_ref, df_checklist, week_labels = build_checklist_weeks(
+                facts=facts,
+                companies_keys=companies_keys,
+                thresholds=thresholds,
+                low_volume_threshold=int(low_volume_threshold),
+            )
+
             df_baas = parse_baas_csv(baas_file) if baas_file is not None else pd.DataFrame()
-            df_checklist2, kpi_blocked_accounts, kpi_blocked_sum = enrich_with_baas_accounts(df_checklist, df_baas)
+            df_final, kpi_blocked_accounts, kpi_blocked_sum = enrich_baas(df_checklist, df_baas)
 
             st.session_state["day_ref"] = day_ref
-            st.session_state["df_checklist"] = df_checklist2
-            st.session_state["w_meta"] = w_meta
-            st.session_state["kpi_blocked_accounts"] = kpi_blocked_accounts
-            st.session_state["kpi_blocked_sum"] = kpi_blocked_sum
-            st.session_state["page_checklist"] = 1
+            st.session_state["week_labels"] = week_labels
+            st.session_state["df_final"] = df_final
+            st.session_state["kpi_blocked_accounts"] = int(kpi_blocked_accounts)
+            st.session_state["kpi_blocked_sum"] = float(kpi_blocked_sum)
+            st.session_state["page"] = 1
 
-# Render
-if "df_checklist" not in st.session_state:
-    st.info("Aguardando você preencher as empresas + subir o CSV e clicar em **Processar**.")
-    st.stop()
+    if "df_final" not in st.session_state:
+        st.info("Preencha empresas + suba CSV + clique em **Processar**.")
+        st.stop()
 
-df_checklist = st.session_state.get("df_checklist", pd.DataFrame())
-day_ref = st.session_state.get("day_ref", "—")
-w_meta = st.session_state.get("w_meta", {})
-kpi_blocked_accounts = int(st.session_state.get("kpi_blocked_accounts", 0))
+    df_final = st.session_state.get("df_final", pd.DataFrame())
+    week_labels = st.session_state.get("week_labels", {})
+    day_ref = st.session_state.get("day_ref", "—")
+    kpi_blocked_accounts = int(st.session_state.get("kpi_blocked_accounts", 0))
 
-# KPIs topo
-k1, k2, k3, k4, k5 = st.columns(5, gap="small")
-with k1:
-    st.metric("Dia de referência", day_ref)
-with k2:
-    uniq_companies = int(df_checklist["company_key"].nunique()) if not df_checklist.empty else 0
-    st.metric("Empresas filtradas", fmt_int_pt(uniq_companies))
-with k3:
-    alerts_count = int((df_checklist["status"] != "Normal").sum()) if not df_checklist.empty else 0
-    st.metric("Alertas", fmt_int_pt(alerts_count))
-with k4:
-    critical = int((df_checklist["status"] == "Alerta (queda/ zerada)").sum()) if not df_checklist.empty else 0
-    st.metric("Alertas críticos", fmt_int_pt(critical))
-with k5:
-    st.metric("Contas com bloqueio", fmt_int_pt(kpi_blocked_accounts))
+    k1, k2, k3, k4, k5 = st.columns(5, gap="small")
+    with k1:
+        st.metric("Dia de referência", day_ref)
+    with k2:
+        st.metric("Empresas filtradas", fmt_int_pt(int(df_final["company_key"].nunique()) if not df_final.empty else 0))
+    with k3:
+        st.metric("Alertas", fmt_int_pt(int((df_final["status"] != "Normal").sum()) if not df_final.empty else 0))
+    with k4:
+        st.metric("Alertas críticos", fmt_int_pt(int((df_final["status"] == "Alerta (queda/ zerada)").sum()) if not df_final.empty else 0))
+    with k5:
+        st.metric("Contas com bloqueio", fmt_int_pt(kpi_blocked_accounts))
 
-st.divider()
+    st.divider()
 
-st.subheader("Visão Geral")
-render_status_boxes(df_checklist)
-st.divider()
+    st.subheader("Visão Geral")
+    render_status_boxes(df_final)
+    st.divider()
 
-# Gauge + Top30
-if px is not None and go is not None and not df_checklist.empty:
-    left, right = st.columns([1.1, 1.0], gap="large")
+    if px is None or go is None:
+        st.warning("Instale plotly para ver o Ground e gráficos.")
+    elif df_final.empty:
+        st.info("Sem dados.")
+    else:
+        left, right = st.columns([1.1, 1.0], gap="large")
 
-    def _rng(w):
-        a, b = w_meta.get(w, (None, None))
-        return fmt_range(a, b)
+        df_final["select_key"] = df_final["company_name"].astype(str) + " | " + df_final["account_id"].astype(str)
+        options = ["TOTAL GERAL"] + sorted(df_final["select_key"].unique().tolist())
 
-    with left:
-        st.caption("Painel (Total geral ou por conta)")
+        with left:
+            st.caption("Ground (Total geral ou por Conta)")
+            selected = st.selectbox("Selecionar", options, index=0, key="ground_select")
 
-        # ✅ dropdown por CONTA (igual checklist)
-        df_checklist["_gkey"] = df_checklist["company_name"].astype(str) + " | Conta " + df_checklist["account_id"].astype(str)
-        account_options = sorted(df_checklist["_gkey"].unique().tolist())
-        options = ["TOTAL GERAL"] + account_options
+            if selected == "TOTAL GERAL":
+                scope = df_final.copy()
+                title = "TOTAL 4 SEMANAS (GERAL)"
+                w1 = int(scope["week1"].sum())
+                w2 = int(scope["week2"].sum())
+                w3 = int(scope["week3"].sum())
+                w4 = int(scope["week4"].sum())
+                credit = int(scope["credit"].sum())
+                debit = int(scope["debit"].sum())
+                total_4w = int(scope["total_4w"].sum())
+                avg_prev = (w1 + w2 + w3) / 3.0 if (w1 + w2 + w3) > 0 else 0.0
+                var = (w4 - avg_prev) / avg_prev if avg_prev > 0 else 0.0
+            else:
+                scope = df_final[df_final["select_key"] == selected].copy()
+                r = scope.iloc[0]
+                title = selected
+                w1, w2, w3, w4 = int(r["week1"]), int(r["week2"]), int(r["week3"]), int(r["week4"])
+                credit, debit = int(r["credit"]), int(r["debit"])
+                total_4w = int(r["total_4w"])
+                var = float(r.get("var_week4_vs_prev", 0.0))
 
-        selected = st.selectbox("Selecionar", options, index=0, key="gauge_account_select")
+            render_ground_panel(
+                title=title,
+                w1=w1, w2=w2, w3=w3, w4=w4,
+                credit=credit, debit=debit, total_4w=total_4w,
+                var=var,
+                height=int(ground_height),
+                labels=week_labels,
+            )
 
-        if selected == "TOTAL GERAL":
-            df_scope = df_checklist.copy()
-            title = "TOTAL (4 SEMANAS)"
-        else:
-            df_scope = df_checklist[df_checklist["_gkey"] == selected].copy()
-            title = selected
+        with right:
+            st.caption("Top variação (S4 vs média S1–S3) — piores / melhores")
+            topn = st.selectbox("Top", [8, 10, 15], index=0, key="topn_select")
 
-        w1 = int(df_scope["w1"].sum())
-        w2 = int(df_scope["w2"].sum())
-        w3 = int(df_scope["w3"].sum())
-        w4 = int(df_scope["w4"].sum())
-        total_4w = int(df_scope["total_4w"].sum())
+            g = df_final.groupby(["company_name"], as_index=False).agg(
+                w1=("week1", "sum"),
+                w2=("week2", "sum"),
+                w3=("week3", "sum"),
+                w4=("week4", "sum"),
+            )
+            g["avg_prev"] = (g["w1"] + g["w2"] + g["w3"]) / 3.0
+            g["var"] = np.where(g["avg_prev"] > 0, (g["w4"] - g["avg_prev"]) / g["avg_prev"], 0.0)
 
-        ref_mean = safe_div((w1 + w2 + w3), 3)
-        var_w4 = calc_var(w4, ref_mean)
-        var_w4_pct = pct_int_ceil_ratio(var_w4)
+            worst = g.sort_values("var", ascending=True).head(int(topn))
+            best = g.sort_values("var", ascending=False).head(int(topn))
+            merged = pd.concat([worst, best], ignore_index=True)
+            merged["sign"] = np.where(merged["var"] >= 0, "pos", "neg")
 
-        render_gauge_and_week_cards(
-            title=title,
-            w1=w1, w2=w2, w3=w3, w4=w4,
-            w1_range=_rng("W1"), w2_range=_rng("W2"), w3_range=_rng("W3"), w4_range=_rng("W4"),
-            var_w4_pct=var_w4_pct,
-            total_4w=total_4w,
-            height=int(ground_height),  # ✅ controle de altura
-        )
+            fig = px.bar(
+                merged,
+                x="company_name",
+                y="var",
+                color="sign",
+                color_discrete_map={"pos": STATUS_COLOR["Normal"], "neg": STATUS_COLOR["Alerta (queda/ zerada)"]},
+            )
+            fig.update_layout(
+                showlegend=False,
+                xaxis_title=None,
+                yaxis_title=None,
+                height=480,
+                margin=dict(l=10, r=10, t=10, b=10),
+            )
+            fig.update_traces(marker_line_width=0)
+            fig.update_yaxes(tickformat=".0%")
+            st.plotly_chart(fig, use_container_width=True)
 
-    with right:
-        st.caption("Top variação (W4 vs média W1–W3) — piores / melhores")
-        topn = st.selectbox("Top", [8, 10, 15], index=0, key="topn_select")
+    st.divider()
 
-        g = (
-            df_checklist.groupby(["company_name"], as_index=False)
-            .agg(w1=("w1", "sum"), w2=("w2", "sum"), w3=("w3", "sum"), w4=("w4", "sum"))
-        )
-        g["ref_mean"] = (g["w1"] + g["w2"] + g["w3"]) / 3.0
-        g["var"] = g.apply(lambda r: calc_var(r["w4"], r["ref_mean"]), axis=1)
+    st.subheader("Checklist (por conta)")
 
-        worst = g.sort_values("var", ascending=True).head(int(topn))
-        best = g.sort_values("var", ascending=False).head(int(topn))
-        merged = pd.concat([worst, best], ignore_index=True)
-        merged["sign"] = np.where(merged["var"] >= 0, "pos", "neg")
+    if df_final.empty:
+        st.info("Sem dados para mostrar.")
+        st.stop()
 
-        fig = px.bar(
-            merged,
-            x="company_name",
-            y="var",
-            color="sign",
-            color_discrete_map={"pos": STATUS_COLOR["Normal"], "neg": STATUS_COLOR["Alerta (queda/ zerada)"]},
-        )
-        fig.update_layout(
-            showlegend=False,
-            xaxis_title=None,
-            yaxis_title=None,
-            height=480,
-            margin=dict(l=10, r=10, t=10, b=10),
-        )
-        fig.update_traces(marker_line_width=0)
-        fig.update_yaxes(tickformat=".0%")
+    f1, f2, f3 = st.columns([1.2, 1.0, 0.8], gap="small")
+    with f1:
+        q_empresa = st.text_input("Buscar empresa", value="", key="q_empresa")
+    with f2:
+        q_conta = st.text_input("Buscar conta", value="", key="q_conta")
+    with f3:
+        status_filter = st.selectbox("Status", ["Todos"] + STATUS_ORDER, index=0, key="status_filter")
+
+    view = df_final.copy()
+
+    if q_empresa.strip():
+        q = q_empresa.strip().lower()
+        view = view[view["company_name"].astype(str).str.lower().str.contains(q, na=False)]
+
+    if q_conta.strip():
+        q = re.sub(r"\D+", "", q_conta.strip())
+        if q:
+            view = view[view["account_id"].astype(str).str.contains(q, na=False)]
+
+    if status_filter != "Todos":
+        view = view[view["status"] == status_filter].copy()
+
+    view["Status"] = view["status"].map(lambda s: STATUS_DOT.get(str(s), "⚪")) + " " + view["status"].astype(str) + " " + view["lock_icon"].astype(str)
+
+    show = pd.DataFrame({
+        "Status": view["Status"],
+        "Conta": view["account_id"].astype(str),
+        "Empresa": view["company_name"].astype(str),
+        "Semana 1": view["week1"].astype(int).map(fmt_int_pt),
+        "Semana 2": view["week2"].astype(int).map(fmt_int_pt),
+        "Semana 3": view["week3"].astype(int).map(fmt_int_pt),
+        "Semana 4": view["week4"].astype(int).map(fmt_int_pt),
+        "Crédito (Qtd)": view["credit"].astype(int).map(fmt_int_pt),
+        "Débito (Qtd)": view["debit"].astype(int).map(fmt_int_pt),
+        "Total 4 Semanas": view["total_4w"].astype(int).map(fmt_int_pt),
+        "Saldo Bloqueado": view["saldo_bloqueado_total"].map(fmt_money_pt),
+        "Motivo": view["motivo"].astype(str),
+    })
+
+    st.caption(
+        f"Semana 1: {week_labels.get('w1','')} | Semana 2: {week_labels.get('w2','')} | "
+        f"Semana 3: {week_labels.get('w3','')} | Semana 4: {week_labels.get('w4','')}"
+    )
+
+    total_rows = int(len(show))
+    pages = get_pages(total_rows, int(page_size))
+
+    st.session_state.setdefault("page", 1)
+    st.session_state["page"] = clamp_int(int(st.session_state["page"]), 1, pages)
+
+    st.number_input(
+        f"Página Checklist (1–{pages})",
+        min_value=1,
+        max_value=pages,
+        value=int(st.session_state["page"]),
+        step=1,
+        key="page",
+    )
+
+    page_now = clamp_int(int(st.session_state["page"]), 1, pages)
+    page_df = slice_page(show, page_now, int(page_size))
+    st.dataframe(page_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    st.subheader("Cards (para colar no Discord)")
+    alerts = df_final[df_final["status"] != "Normal"].copy()
+
+    if alerts.empty:
+        st.caption("Nenhum alerta (status != Normal).")
+    else:
+        for _, r in alerts.iterrows():
+            title = f"{r['status']} {r['lock_icon']} — {r['company_name']} | Conta {r['account_id']}"
+            with st.expander(title, expanded=False):
+                msg = (
+                    f"ALERTA: {r['status']}\n"
+                    f"Empresa: {r['company_name']}\n"
+                    f"Conta: {r['account_id']}\n"
+                    f"Data: {r['day_ref']}\n"
+                    f"Motivo: {r['motivo']}\n"
+                    f"Semanas: S1={r['week1']} | S2={r['week2']} | S3={r['week3']} | S4={r['week4']}\n"
+                    f"Crédito(Qtd): {r['credit']} | Débito(Qtd): {r['debit']}\n"
+                    f"Total 4 semanas: {r['total_4w']}\n"
+                    f"Bloqueio: {fmt_money_pt(r.get('saldo_bloqueado_total', 0.0))} {r['lock_icon']}"
+                )
+                st.code(msg, language="text")
+
+
+# =========================
+# BOLHAS
+# =========================
+with tab_bubbles:
+    if "df_final" not in st.session_state:
+        st.info("Você precisa processar na aba Principal primeiro.")
+        st.stop()
+
+    df_final = st.session_state.get("df_final", pd.DataFrame())
+    if df_final.empty:
+        st.info("Sem dados para bolhas.")
+        st.stop()
+
+    st.subheader("Bolhas (Aquário)")
+    st.caption("Tamanho = Total 4 semanas | Cores = status | Borda branca = bloqueio | Hover mostra detalhes")
+
+    df_nodes = pd.DataFrame({
+        "id": df_final["account_id"].astype(str),
+        "label": df_final["account_id"].astype(str),
+        "company": df_final["company_name"].astype(str),
+        "status": df_final["status"].astype(str),
+        "value": df_final["total_4w"].astype(float),
+        "blocked": df_final["has_block"].fillna(False).astype(bool),
+        "blocked_value": df_final["saldo_bloqueado_total"].fillna(0.0).astype(float),
+        "w1": df_final["week1"].astype(int),
+        "w2": df_final["week2"].astype(int),
+        "w3": df_final["week3"].astype(int),
+        "w4": df_final["week4"].astype(int),
+    })
+
+    colA, colB = st.columns([1, 1], gap="small")
+    with colA:
+        bubble_height = st.slider("Altura do aquário", 520, 900, 700, 20)
+    with colB:
+        bubble_scale = st.slider("Tamanho das bolhas", 1.0, 2.5, 1.6, 0.1)
+
+    render_bubble_aquarium(df_nodes, height=int(bubble_height), bubble_scale=float(bubble_scale))
+
+
+# =========================
+# ANALYTICS
+# =========================
+with tab_analytics:
+    if "df_final" not in st.session_state:
+        st.info("Você precisa processar na aba Principal primeiro.")
+        st.stop()
+
+    df_final = st.session_state.get("df_final", pd.DataFrame())
+    if df_final.empty or px is None:
+        st.info("Sem dados (ou plotly não instalado).")
+        st.stop()
+
+    st.subheader("Analytics")
+
+    c1, c2 = st.columns(2, gap="large")
+
+    with c1:
+        st.caption("Distribuição por status (contas)")
+        sc = df_final.groupby("status", as_index=False).size().rename(columns={"size": "count"})
+        sc["ord"] = sc["status"].apply(lambda s: STATUS_ORDER.index(s) if s in STATUS_ORDER else 999)
+        sc = sc.sort_values("ord")
+        fig = px.bar(sc, x="status", y="count", color="status", color_discrete_map=STATUS_COLOR)
+        fig.update_layout(showlegend=False, height=320, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title=None)
         st.plotly_chart(fig, use_container_width=True)
 
-st.divider()
+    with c2:
+        # ✅ substitui o "Total 4 semanas por status" por algo empresa-based e mais explicativo
+        st.caption("Top Empresas por Volume (Total 4 semanas) — cor = pior status da empresa")
+        top_emp = st.slider("Top empresas (por volume total)", 5, 40, 15, 1, key="top_emp_vol")
 
-# Checklist + busca
-st.subheader("Checklist (por conta)")
+        # pior status por empresa (se qualquer conta for Alerta, empresa vira Alerta, etc.)
+        def worst_status(series: pd.Series) -> str:
+            ranks = series.map(severity_rank)
+            i = int(ranks.min()) if len(ranks) else 9
+            for s in STATUS_ORDER:
+                if severity_rank(s) == i:
+                    return s
+            return "Desconhecido"
 
-if df_checklist.empty:
-    st.info("Sem dados para mostrar.")
-    st.stop()
+        ge = df_final.groupby("company_name", as_index=False).agg(
+            total=("total_4w", "sum"),
+            worst_status=("status", worst_status),
+            blocked_accounts=("has_block", "sum"),
+        ).sort_values("total", ascending=False).head(int(top_emp))
 
-f1, f2, f3 = st.columns([1.2, 1.0, 0.8], gap="small")
-with f1:
-    q_empresa = st.text_input("Buscar empresa", value="", key="q_empresa")
-with f2:
-    q_conta = st.text_input("Buscar conta", value="", key="q_conta")
-with f3:
-    status_filter = st.selectbox("Status", ["Todos"] + STATUS_ORDER, index=0, key="status_filter")
+        fig = px.bar(
+            ge.sort_values("total", ascending=True),
+            x="total",
+            y="company_name",
+            orientation="h",
+            color="worst_status",
+            color_discrete_map=STATUS_COLOR,
+            hover_data={"blocked_accounts": True, "total": True, "worst_status": True},
+        )
+        fig.update_layout(
+            height=320,
+            margin=dict(l=10, r=10, t=10, b=10),
+            xaxis_title="Total (4 semanas) — Qtd transações",
+            yaxis_title=None,
+            legend_title=None,
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
-view = df_checklist.copy()
+    st.divider()
 
-if q_empresa.strip():
-    q = q_empresa.strip().lower()
-    view = view[view["company_name"].astype(str).str.lower().str.contains(q, na=False)]
+    st.caption("Evolução semanal (soma por empresa)")
+    top_companies = st.slider("Top empresas (por volume)", 5, 40, 15, 1, key="top_emp_line")
 
-if q_conta.strip():
-    q = q_conta.strip()
-    view = view[view["account_id"].astype(str).str.contains(q, na=False)]
+    g = df_final.groupby("company_name", as_index=False).agg(
+        w1=("week1", "sum"), w2=("week2", "sum"), w3=("week3", "sum"), w4=("week4", "sum"),
+        total=("total_4w", "sum"),
+    ).sort_values("total", ascending=False).head(int(top_companies))
 
-if status_filter != "Todos":
-    view = view[view["status"] == status_filter]
+    melt = g.melt(id_vars=["company_name"], value_vars=["w1", "w2", "w3", "w4"], var_name="week", value_name="qty")
+    week_name = {"w1": "Semana 1", "w2": "Semana 2", "w3": "Semana 3", "w4": "Semana 4"}
+    melt["week"] = melt["week"].map(week_name)
 
-# ✅ Força Conta como STRING (nunca numérica) para não abreviar no Streamlit
-view["Conta"] = view["account_id"].astype(str).map(lambda s: s)  # explicitamente string
-view["Empresa"] = view["company_name"].astype(str)
-view["Status"] = view["status"].map(lambda s: f"{STATUS_DOT.get(s,'⚪')} {s}") + " " + view["lock_icon"].astype(str)
+    fig = px.line(melt, x="week", y="qty", color="company_name", markers=True)
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title="Qtd transações")
+    st.plotly_chart(fig, use_container_width=True)
 
-view["Semana 1"] = view["w1"].apply(lambda x: fmt_int_pt(int(x)))
-view["Semana 2"] = view["w2"].apply(lambda x: fmt_int_pt(int(x)))
-view["Semana 3"] = view["w3"].apply(lambda x: fmt_int_pt(int(x)))
-view["Semana 4"] = view["w4"].apply(lambda x: fmt_int_pt(int(x)))
+    st.divider()
 
-view["Crédito"] = view["credit_4w"].apply(lambda x: fmt_int_pt(int(x)))
-view["Débito"] = view["debit_4w"].apply(lambda x: fmt_int_pt(int(x)))
-view["Total (4S)"] = view["total_4w"].apply(lambda x: fmt_int_pt(int(x)))
-view["Var (W4 vs W1–W3)"] = view["var_w4_pct"].apply(fmt_pct_int)
-view["Saldo Bloqueado"] = view["saldo_bloqueado_total"].apply(fmt_money_pt)
-view["Motivo"] = view["obs"].astype(str)
-
-show = view[
-    ["Status", "Conta", "Empresa", "Semana 1", "Semana 2", "Semana 3", "Semana 4",
-     "Crédito", "Débito", "Total (4S)", "Var (W4 vs W1–W3)", "Saldo Bloqueado", "Motivo"]
-].copy()
-
-# Paginação
-total_rows = int(len(show))
-pages = get_pages(total_rows, int(page_size_checklist))
-
-st.session_state.setdefault("page_checklist", 1)
-st.session_state["page_checklist"] = max(1, min(pages, int(st.session_state["page_checklist"])))
-
-st.number_input(
-    f"Página Checklist (1–{pages})",
-    min_value=1,
-    max_value=pages,
-    value=int(st.session_state["page_checklist"]),
-    step=1,
-    key="page_checklist",
-)
-
-page_now = max(1, min(pages, int(st.session_state["page_checklist"])))
-page_df = slice_page(show, page_now, int(page_size_checklist))
-
-st.dataframe(page_df, use_container_width=True, hide_index=True)
-
-st.divider()
-
-# Cards (Discord)
-st.subheader("Cards (para colar no Discord)")
-
-alerts = df_checklist[df_checklist["status"] != "Normal"].copy()
-if alerts.empty:
-    st.caption("Nenhum alerta (status != Normal).")
-else:
-    for _, r in alerts.iterrows():
-        title = f"{r['status']} {r['lock_icon']} — {r['company_name']} | Conta {r['account_id']}"
-        with st.expander(title, expanded=False):
-            msg = (
-                f"ALERTA: {r['status']}\n"
-                f"Empresa: {r['company_name']}\n"
-                f"Conta: {r['account_id']}\n"
-                f"Data: {r['day_ref']}\n"
-                f"Motivo: {r['obs']}\n"
-                f"W1={r['w1']} | W2={r['w2']} | W3={r['w3']} | W4={r['w4']}\n"
-                f"Variação (W4 vs média W1–W3): {r['var_w4_pct']}%\n"
-                f"Crédito(4S): {r['credit_4w']} | Débito(4S): {r['debit_4w']} | Total(4S): {r['total_4w']}\n"
-                f"Bloqueio: {fmt_money_pt(r.get('saldo_bloqueado_total', 0.0))} {r['lock_icon']}"
-            )
-            st.code(msg, language="text")
+    st.caption("Motivos (top)")
+    mc = df_final.groupby("motivo", as_index=False).size().rename(columns={"size": "count"}).sort_values("count", ascending=False)
+    fig = px.bar(mc.head(12), x="motivo", y="count")
+    fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title=None)
+    st.plotly_chart(fig, use_container_width=True)
