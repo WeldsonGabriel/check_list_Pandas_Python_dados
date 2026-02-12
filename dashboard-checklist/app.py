@@ -3,8 +3,9 @@
 # e 3 abas: Principal | Bolhas (Aquário) | Analytics
 #
 # Ajustes desta versão:
-# ✅ Bolhas maiores e preenchendo melhor o aquário + slider "Tamanho das bolhas"
-# ✅ Substitui "Total 4 semanas por status" por "Top Empresas por Volume (Total 4 semanas)" (empresa-based)
+# ✅ Corrige parsing de CREDIT UN / DEBIT UN quando vem com separador de milhar tipo "448.326"
+#    (antes virava 448; agora vira 448326)
+# ✅ Mantém todo o resto do app exatamente como estava
 
 from __future__ import annotations
 
@@ -225,6 +226,33 @@ def _parse_person(person: str) -> Tuple[str, str]:
     return "", s.strip()
 
 
+# ✅ BUGFIX: parse correto de quantidade quando vem "448.326" (milhar) / "448,326" etc.
+def parse_count(x) -> int:
+    if x is None:
+        return 0
+    s = str(x).strip()
+    if not s:
+        return 0
+
+    # remove espaços
+    s = s.replace(" ", "")
+
+    # padrão do seu CSV: ponto como separador de milhar (sem vírgula)
+    if "." in s and "," not in s:
+        s = s.replace(".", "")
+
+    # se vier com vírgula por algum motivo, remove também
+    s = s.replace(",", "")
+
+    # remove lixo
+    s = re.sub(r"[^\d\-]", "", s)
+
+    try:
+        return int(s)
+    except Exception:
+        return 0
+
+
 def parse_transactions_csv(uploaded_file) -> pd.DataFrame:
     """
     Interpretação:
@@ -268,8 +296,9 @@ def parse_transactions_csv(uploaded_file) -> pd.DataFrame:
     company_name = acc_emp.apply(lambda t: t[1]).astype(str).str.strip()
     company_key = company_name.map(normalize_company)
 
-    credit_cnt = pd.to_numeric(credit_raw, errors="coerce").fillna(0).astype(int)
-    debit_cnt = pd.to_numeric(debit_raw, errors="coerce").fillna(0).astype(int)
+    # ✅ FIX AQUI (antes era to_numeric + astype(int))
+    credit_cnt = credit_raw.apply(parse_count)
+    debit_cnt = debit_raw.apply(parse_count)
 
     out = pd.DataFrame({
         "date": d,
@@ -817,9 +846,7 @@ def render_bubble_aquarium(df_nodes: pd.DataFrame, height: int = 700, bubble_sca
         <div class="t-row">Total 4 semanas: <b>${{d.value}}</b></div>
         <div class="t-row">Semana 1: <b>${{d.w1}}</b> | Semana 2: <b>${{d.w2}}</b></div>
         <div class="t-row">Semana 3: <b>${{d.w3}}</b> | Semana 4: <b>${{d.w4}}</b></div>
-        <div class="t-row">Bloqueio: <b>${{b}}</b> (${{
-          d.blocked_value != null ? d.blocked_value : 0
-        }})</div>
+        <div class="t-row">Bloqueio: <b>${{b}}</b> (${{ d.blocked_value != null ? d.blocked_value : 0 }})</div>
       `;
       tooltip.style.opacity = 1;
       tooltip.style.left = (event.pageX + 14) + "px";
@@ -1231,11 +1258,9 @@ with tab_analytics:
         st.plotly_chart(fig, use_container_width=True)
 
     with c2:
-        # ✅ substitui o "Total 4 semanas por status" por algo empresa-based e mais explicativo
         st.caption("Top Empresas por Volume (Total 4 semanas) — cor = pior status da empresa")
         top_emp = st.slider("Top empresas (por volume total)", 5, 40, 15, 1, key="top_emp_vol")
 
-        # pior status por empresa (se qualquer conta for Alerta, empresa vira Alerta, etc.)
         def worst_status(series: pd.Series) -> str:
             ranks = series.map(severity_rank)
             i = int(ranks.min()) if len(ranks) else 9
