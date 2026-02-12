@@ -5,6 +5,7 @@
 # Ajustes desta versão:
 # ✅ Corrige parsing de CREDIT UN / DEBIT UN quando vem com separador de milhar tipo "448.326"
 #    (antes virava 448; agora vira 448326)
+# ✅ ✅ (NOVO) Remove D-1: semanas agora terminam no ÚLTIMO DIA real do CSV (day_ref), não em day_ref-1
 # ✅ Mantém todo o resto do app exatamente como estava
 
 from __future__ import annotations
@@ -369,15 +370,17 @@ def parse_baas_csv(uploaded_file) -> pd.DataFrame:
 
 
 # =========================
-# Janela de semanas (28d terminando em D-1)
+# Janela de semanas (28d terminando no último dia do CSV)  ✅ (SEM D-1)
 # =========================
 def compute_week_ranges(day_ref: pd.Timestamp) -> Dict[str, Tuple[pd.Timestamp, pd.Timestamp]]:
-    d1 = (pd.to_datetime(day_ref) - timedelta(days=1)).normalize()
-    start = d1 - timedelta(days=27)
+    end = pd.to_datetime(day_ref).normalize()  # ✅ último dia real do CSV
+    start = end - timedelta(days=27)
+
     w1 = (start, start + timedelta(days=6))
     w2 = (start + timedelta(days=7), start + timedelta(days=13))
     w3 = (start + timedelta(days=14), start + timedelta(days=20))
-    w4 = (start + timedelta(days=21), d1)
+    w4 = (start + timedelta(days=21), end)
+
     return {"w1": w1, "w2": w2, "w3": w3, "w4": w4}
 
 
