@@ -7,6 +7,11 @@
 #    (antes virava 448; agora vira 448326)
 # ✅ ✅ (NOVO) Remove D-1: semanas agora terminam no ÚLTIMO DIA real do CSV (day_ref), não em day_ref-1
 # ✅ Mantém todo o resto do app exatamente como estava
+#
+# ✅ ✅ ✅ (NOVO) Adiciona 4ª aba: "Análise (Diário)" (transações por dia, do 1º ao último dia do CSV)
+#    - cards dinâmicos por empresa / total
+#    - filtro por empresa (selectbox) + busca por nome + busca por conta
+#    - tabela com colunas por dia + total
 
 from __future__ import annotations
 
@@ -910,6 +915,71 @@ def render_bubble_aquarium(df_nodes: pd.DataFrame, height: int = 700, bubble_sca
 
 
 # =========================
+# Daily matrix (Análise por dia)  ✅ NOVO
+# =========================
+def build_daily_matrix(
+    facts: pd.DataFrame,
+    companies_keys: List[str],
+) -> Tuple[pd.Timestamp, pd.Timestamp, pd.DataFrame]:
+    """
+    Gera tabela por dia (do 1º ao último dia do CSV), por empresa e conta.
+
+    Saída:
+      start_day (Timestamp), end_day (Timestamp), table (DataFrame)
+    table:
+      Empresa | Conta | (colunas de dia) | Total
+    """
+    if facts is None or facts.empty:
+        return pd.NaT, pd.NaT, pd.DataFrame()
+
+    base = facts.copy()
+    if companies_keys:
+        base = base[base["company_key"].isin(set(companies_keys))].copy()
+
+    if base.empty:
+        return pd.NaT, pd.NaT, pd.DataFrame()
+
+    base["date_dt"] = pd.to_datetime(base["date"], errors="coerce").dt.normalize()
+    base = base.dropna(subset=["date_dt"]).copy()
+
+    start_day = base["date_dt"].min()
+    end_day = base["date_dt"].max()
+
+    all_days = pd.date_range(start=start_day, end=end_day, freq="D")
+
+    daily = (
+        base.groupby(["company_name", "account_id", "date_dt"], as_index=False)["total_cnt"]
+        .sum()
+        .rename(columns={"total_cnt": "qty"})
+    )
+
+    pivot = (
+        daily.pivot_table(
+            index=["company_name", "account_id"],
+            columns="date_dt",
+            values="qty",
+            aggfunc="sum",
+            fill_value=0,
+        )
+        .reindex(columns=all_days, fill_value=0)
+    )
+
+    pivot["Total"] = pivot.sum(axis=1)
+
+    out = pivot.reset_index().rename(columns={"company_name": "Empresa", "account_id": "Conta"})
+
+    out["Empresa_sort"] = out["Empresa"].astype(str).str.lower()
+    out["Conta_sort"] = out["Conta"].astype(str)
+    out = (
+        out.sort_values(["Empresa_sort", "Conta_sort"])
+        .drop(columns=["Empresa_sort", "Conta_sort"])
+        .reset_index(drop=True)
+    )
+
+    return start_day, end_day, out
+
+
+# =========================
 # App
 # =========================
 st.title("Checklist (Semanas 1–4) + Bloqueio (BaaS)")
@@ -938,7 +1008,9 @@ thresholds = Thresholds(
     investigar_abs=float(investigar_abs),
 )
 
-tab_main, tab_bubbles, tab_analytics = st.tabs(["Principal", "Bolhas (Aquário)", "Analytics"])
+tab_main, tab_bubbles, tab_analytics, tab_daily = st.tabs(
+    ["Principal", "Bolhas (Aquário)", "Analytics", "Análise (Diário)"]
+)
 
 # =========================
 # PRINCIPAL
@@ -974,6 +1046,9 @@ with tab_main:
             if facts.empty:
                 st.error("CSV de transações ficou vazio após leitura/normalização.")
                 st.stop()
+
+            # ✅ NOVO: salva facts para a aba Diário
+            st.session_state["facts"] = facts
 
             day_ref, df_checklist, week_labels = build_checklist_weeks(
                 facts=facts,
@@ -1321,3 +1396,108 @@ with tab_analytics:
     fig = px.bar(mc.head(12), x="motivo", y="count")
     fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title=None)
     st.plotly_chart(fig, use_container_width=True)
+
+
+# =========================
+# ANÁLISE (DIÁRIO)  ✅ NOVO
+# =========================
+with tab_daily:
+    if "df_final" not in st.session_state:
+        st.info("Você precisa processar na aba Principal primeiro.")
+        st.stop()
+
+    if "facts" not in st.session_state:
+        st.info("Reprocesse na aba Principal (faltou salvar o facts).")
+        st.stop()
+
+    facts = st.session_state.get("facts", pd.DataFrame())
+    if facts is None or facts.empty:
+        st.info("Sem dados de transações para análise diária.")
+        st.stop()
+
+    df_final = st.session_state.get("df_final", pd.DataFrame())
+    if df_final is None or df_final.empty:
+        st.info("Sem dados finais (df_final) para análise diária.")
+        st.stop()
+
+    companies_keys = sorted(df_final["company_key"].dropna().astype(str).unique().tolist())
+    companies_names = sorted(df_final["company_name"].dropna().astype(str).unique().tolist())
+
+    st.subheader("Análise de Transações por Dia")
+    st.caption("Tabela por dia (do 1º ao último dia do CSV) — por empresa e conta. Total no fim da linha.")
+
+    cA, cB, cC = st.columns([1.2, 1.0, 1.0], gap="small")
+    with cA:
+        selected_company = st.selectbox(
+            "Empresa (filtro)",
+            options=["TOTAL GERAL"] + companies_names,
+            index=0,
+            key="daily_company_select",
+        )
+    with cB:
+        q_nome = st.text_input("Buscar por nome", value="", key="daily_q_nome")
+    with cC:
+        q_conta = st.text_input("Buscar por conta", value="", key="daily_q_conta")
+
+    start_day, end_day, daily_table = build_daily_matrix(facts=facts, companies_keys=companies_keys)
+
+    if daily_table.empty or pd.isna(start_day) or pd.isna(end_day):
+        st.info("Sem dados suficientes para montar a tabela diária.")
+        st.stop()
+
+    view = daily_table.copy()
+
+    if selected_company != "TOTAL GERAL":
+        view = view[view["Empresa"] == selected_company].copy()
+
+    if q_nome.strip():
+        q = q_nome.strip().lower()
+        view = view[view["Empresa"].astype(str).str.lower().str.contains(q, na=False)]
+
+    if q_conta.strip():
+        q = re.sub(r"\D+", "", q_conta.strip())
+        if q:
+            view = view[view["Conta"].astype(str).str.contains(q, na=False)]
+
+    empresas_filtradas = int(view["Empresa"].nunique()) if not view.empty else 0
+    day_cols = [c for c in view.columns if isinstance(c, pd.Timestamp)]
+    total_periodo = int(view["Total"].sum()) if not view.empty else 0
+
+    last_day_total = 0
+    if not view.empty and len(day_cols) > 0:
+        if end_day in view.columns:
+            last_day_total = int(view[end_day].sum())
+
+    freq_pct = 0.0
+    if not view.empty and len(day_cols) > 0:
+        day_sums = view[day_cols].sum(axis=0)
+        days_with_tx = int((day_sums > 0).sum())
+        freq_pct = (days_with_tx / max(1, len(day_cols))) * 100.0
+
+    k1, k2, k3, k4 = st.columns(4, gap="small")
+    with k1:
+        st.metric("Empresas filtradas (escopo)", fmt_int_pt(empresas_filtradas))
+    with k2:
+        st.metric("Total transações (período)", fmt_int_pt(total_periodo))
+    with k3:
+        st.metric("Total no último dia do CSV", fmt_int_pt(last_day_total))
+    with k4:
+        st.metric("Frequência (dias com TX)", f"{freq_pct:.0f}%")
+
+    st.divider()
+
+    pretty = view.copy()
+
+    rename_map = {}
+    for c in pretty.columns:
+        if isinstance(c, pd.Timestamp):
+            rename_map[c] = c.strftime("%d")
+
+    pretty = pretty.rename(columns=rename_map)
+
+    for col in list(rename_map.values()) + ["Total"]:
+        if col in pretty.columns:
+            pretty[col] = pretty[col].astype(int).map(fmt_int_pt)
+
+    st.caption(f"Período do CSV: {start_day.date().isoformat()} → {end_day.date().isoformat()}")
+    st.dataframe(pretty, use_container_width=True, hide_index=True)
