@@ -13,6 +13,14 @@
 #   2) "Análise (Diário)" (tabela dia 1..N + “assistente” de explicação por conta/empresa)
 # - BaaS: além de "Saldo Bloqueado", também lê "Saldo" (se existir no CSV)
 #
+# ✅ NOVO (pedido atual):
+# - Adiciona 4ª aba: "Gráficos (Diário)" SEM mexer no que já existe
+#   4 gráficos (visuais) baseados no diário:
+#     1) Série diária (Total de transações por dia)
+#     2) Top Empresas (Total no período)
+#     3) Contas zeradas por dia (count)
+#     4) Contas em queda por dia (count) — usa baseline_days + drop_ratio do AlertConfig
+#
 # Observação:
 # - O “assistente” aqui NÃO usa LLM: ele só calcula métricas e gera explicação determinística.
 
@@ -966,8 +974,6 @@ def build_alerts(
         streak_zero = compute_streak_tail(series, lambda v: int(v) == 0)
 
         # streak queda (abaixo de baseline)
-        # baseline = média dos últimos cfg.baseline_days anteriores ao dia atual (rolling simples no tail)
-        # Para ficar robusto e rápido: calcula baseline global do período (ignorando zeros opcionais) e compara tail.
         if len(series) >= max(2, cfg.baseline_days + 1):
             baseline = float(np.mean(series[-(cfg.baseline_days + 1):-1]))
         elif len(series) >= 2:
@@ -1096,6 +1102,119 @@ def assistant_explain_row(row: pd.Series, cfg: AlertConfig) -> str:
 
 
 # =========================
+# Gráficos (Diário) — helpers  ✅ NOVO
+# =========================
+def _daily_totals_from_facts(
+    facts: pd.DataFrame,
+    companies_keys: List[str],
+    *,
+    company_name_filter: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Retorna DataFrame: date_dt | total
+    """
+    if facts is None or facts.empty:
+        return pd.DataFrame(columns=["date_dt", "total"])
+
+    base = facts.copy()
+    if companies_keys:
+        base = base[base["company_key"].isin(set(companies_keys))].copy()
+    base["date_dt"] = pd.to_datetime(base["date"], errors="coerce").dt.normalize()
+    base = base.dropna(subset=["date_dt"]).copy()
+
+    if company_name_filter and company_name_filter != "TOTAL GERAL":
+        base = base[base["company_name"].astype(str) == str(company_name_filter)].copy()
+
+    if base.empty:
+        return pd.DataFrame(columns=["date_dt", "total"])
+
+    g = base.groupby("date_dt", as_index=False)["total_cnt"].sum().rename(columns={"total_cnt": "total"})
+    g = g.sort_values("date_dt").reset_index(drop=True)
+    return g
+
+
+def _top_companies_from_facts(
+    facts: pd.DataFrame,
+    companies_keys: List[str],
+    *,
+    topn: int = 15,
+    company_name_filter: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Retorna DataFrame: company_name | total
+    Se company_name_filter != TOTAL, retorna só aquela empresa (topn irrelevante).
+    """
+    if facts is None or facts.empty:
+        return pd.DataFrame(columns=["company_name", "total"])
+
+    base = facts.copy()
+    if companies_keys:
+        base = base[base["company_key"].isin(set(companies_keys))].copy()
+
+    if company_name_filter and company_name_filter != "TOTAL GERAL":
+        base = base[base["company_name"].astype(str) == str(company_name_filter)].copy()
+
+    if base.empty:
+        return pd.DataFrame(columns=["company_name", "total"])
+
+    g = base.groupby("company_name", as_index=False)["total_cnt"].sum().rename(columns={"total_cnt": "total"})
+    g = g.sort_values("total", ascending=False).head(int(topn)).reset_index(drop=True)
+    return g
+
+
+def _zero_and_down_counts_by_day(
+    daily_table: pd.DataFrame,
+    cfg: AlertConfig,
+) -> pd.DataFrame:
+    """
+    A partir do daily_table (Empresa/Conta + colunas Timestamp), calcula:
+      - zero_accounts: #contas com 0 naquele dia
+      - down_accounts: #contas em queda naquele dia (vs baseline rolling por conta)
+    Retorna: date_dt | zero_accounts | down_accounts
+    """
+    if daily_table is None or daily_table.empty:
+        return pd.DataFrame(columns=["date_dt", "zero_accounts", "down_accounts"])
+
+    day_cols = [c for c in daily_table.columns if isinstance(c, pd.Timestamp)]
+    if not day_cols:
+        return pd.DataFrame(columns=["date_dt", "zero_accounts", "down_accounts"])
+
+    X = daily_table[day_cols].to_numpy(dtype=float)  # (n_accounts, n_days)
+    n_accounts, n_days = X.shape
+
+    # zerados por dia
+    zero_accounts = (X <= 0).sum(axis=0).astype(int)
+
+    # queda por dia (baseline rolling por conta)
+    down_accounts = np.zeros(n_days, dtype=int)
+
+    k = int(max(2, cfg.baseline_days))
+    ratio = float(cfg.drop_ratio)
+
+    # para cada dia j, baseline = média dos k dias anteriores (j-k..j-1)
+    for j in range(n_days):
+        if j <= 0:
+            down_accounts[j] = 0
+            continue
+        start = max(0, j - k)
+        prev = X[:, start:j]  # até j-1
+        # baseline por conta
+        baseline = np.mean(prev, axis=1)
+        thresh = baseline * ratio
+        # queda: baseline>0 e atual < thresh
+        down = (baseline > 0) & (X[:, j] < thresh)
+        down_accounts[j] = int(down.sum())
+
+    out = pd.DataFrame({
+        "date_dt": pd.to_datetime(day_cols),
+        "zero_accounts": zero_accounts,
+        "down_accounts": down_accounts,
+    }).sort_values("date_dt").reset_index(drop=True)
+
+    return out
+
+
+# =========================
 # App
 # =========================
 st.title("Checklist (Semanas 1–4) + Saldos/Bloqueio (BaaS)")
@@ -1168,7 +1287,8 @@ alert_cfg = AlertConfig(
     drop_ratio=float(drop_ratio),
 )
 
-tab_main, tab_alerts, tab_daily = st.tabs(["Principal", "Alertas", "Análise (Diário)"])
+# ✅ Só adiciona a nova aba, sem mexer no resto
+tab_main, tab_alerts, tab_daily, tab_graphs = st.tabs(["Principal", "Alertas", "Análise (Diário)", "Gráficos (Diário)"])
 
 
 # =========================
@@ -1453,7 +1573,6 @@ with tab_alerts:
     # KPIs de topo (diário)
     day_ref = st.session_state.get("day_ref", "—")
     total_accounts = int(len(v))
-    red_count = int(((v["tone_zero"] == "red") | (v["tone_down"] == "red") | (v["tone_block"] == "red") | (v["tone_freq"] == "red")).sum())
     zero_now = int((v["Streak_zero"] > 0).sum())
     block_now = int((v["Saldo_Bloqueado"] > 0).sum())
 
@@ -1588,7 +1707,6 @@ with tab_daily:
         row_daily = view[(view["Empresa"] == emp_sel) & (view["Conta"] == acc_sel)].iloc[0].copy()
 
         # gera “row alerta” on-the-fly para essa conta (reusa engine)
-        # (para ter streaks, baseline, faróis, etc.)
         tmp_daily = pd.DataFrame([row_daily])
         tmp_alerts = build_alerts(tmp_daily, start_day, end_day, df_final, alert_cfg)
         if tmp_alerts is not None and not tmp_alerts.empty:
@@ -1618,3 +1736,112 @@ with tab_daily:
 
     st.caption(f"Período do CSV: {start_day.date().isoformat()} → {end_day.date().isoformat()}")
     st.dataframe(pretty, use_container_width=True, hide_index=True)
+
+
+# =========================
+# GRÁFICOS (DIÁRIO)  ✅ NOVO
+# =========================
+with tab_graphs:
+    if "facts" not in st.session_state or "daily_table" not in st.session_state:
+        st.info("Você precisa processar na aba Principal primeiro.")
+        st.stop()
+
+    if px is None:
+        st.warning("Instale plotly para ver os gráficos (plotly.express).")
+        st.stop()
+
+    facts = st.session_state.get("facts", pd.DataFrame())
+    companies_keys = st.session_state.get("companies_keys", [])
+    daily_table_all = st.session_state.get("daily_table", pd.DataFrame())
+    start_day = st.session_state.get("daily_start", pd.NaT)
+    end_day = st.session_state.get("daily_end", pd.NaT)
+
+    if facts is None or facts.empty or daily_table_all is None or daily_table_all.empty:
+        st.info("Sem dados suficientes para gráficos.")
+        st.stop()
+
+    st.subheader("Gráficos (Diário)")
+    st.caption("Visual rápido do período diário (1..N do CSV). Tudo aqui é calculado localmente (sem LLM).")
+
+    companies_names = ["TOTAL GERAL"] + sorted(daily_table_all["Empresa"].dropna().astype(str).unique().tolist())
+
+    g1, g2 = st.columns([1.2, 0.8], gap="small")
+    with g1:
+        g_company = st.selectbox("Empresa (escopo dos gráficos)", options=companies_names, index=0, key="graphs_company")
+    with g2:
+        topn_emp = st.selectbox("Top empresas", options=[8, 10, 15, 20, 30], index=2, key="graphs_topn")
+
+    # filtra daily_table para o escopo escolhido (apenas para zerado/queda)
+    daily_scope = daily_table_all.copy()
+    if g_company != "TOTAL GERAL":
+        daily_scope = daily_scope[daily_scope["Empresa"].astype(str) == str(g_company)].copy()
+
+    # 1) Série diária total
+    ts = _daily_totals_from_facts(facts, companies_keys, company_name_filter=g_company)
+    if ts.empty:
+        st.info("Sem dados para série diária no escopo atual.")
+        st.stop()
+
+    # 2) Top empresas
+    top_emp_df = _top_companies_from_facts(facts, companies_keys, topn=int(topn_emp), company_name_filter="TOTAL GERAL")
+
+    # 3/4) Zerado e Queda por dia (counts)
+    zero_down = _zero_and_down_counts_by_day(daily_scope, alert_cfg)
+
+    # KPIs rápidos
+    kA, kB, kC, kD = st.columns(4, gap="small")
+    with kA:
+        st.metric("Período", f"{pd.to_datetime(ts['date_dt'].min()).date().isoformat()} → {pd.to_datetime(ts['date_dt'].max()).date().isoformat()}")
+    with kB:
+        st.metric("Total (escopo)", fmt_int_pt(int(ts["total"].sum())))
+    with kC:
+        st.metric("Média por dia", fmt_int_pt(int(round(float(ts["total"].mean())))))
+    with kD:
+        st.metric("Pico diário", fmt_int_pt(int(ts["total"].max())))
+
+    st.divider()
+
+    # Layout 2x2 dos 4 gráficos
+    c1, c2 = st.columns(2, gap="large")
+
+    with c1:
+        st.caption("1) Total de transações por dia (escopo)")
+        fig = px.line(ts, x="date_dt", y="total", markers=True)
+        fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title=None)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        st.caption(f"2) Top empresas por volume (período) — Top {int(topn_emp)}")
+        if top_emp_df.empty:
+            st.info("Sem dados para Top empresas.")
+        else:
+            fig = px.bar(
+                top_emp_df.sort_values("total", ascending=True),
+                x="total",
+                y="company_name",
+                orientation="h",
+            )
+            fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title=None)
+            st.plotly_chart(fig, use_container_width=True)
+
+    c3, c4 = st.columns(2, gap="large")
+
+    with c3:
+        st.caption("3) Contas zeradas por dia (count) — escopo")
+        if zero_down.empty:
+            st.info("Sem dados para zerados por dia.")
+        else:
+            fig = px.line(zero_down, x="date_dt", y="zero_accounts", markers=True)
+            fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title=None)
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Interpretação: número de contas com **0** transações em cada dia do CSV.")
+
+    with c4:
+        st.caption(f"4) Contas em queda por dia (count) — baseline {alert_cfg.baseline_days}d e limiar {int(alert_cfg.drop_ratio*100)}%")
+        if zero_down.empty:
+            st.info("Sem dados para queda por dia.")
+        else:
+            fig = px.line(zero_down, x="date_dt", y="down_accounts", markers=True)
+            fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title=None)
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Interpretação: para cada conta, calcula baseline rolling dos dias anteriores e marca queda quando o dia atual fica abaixo do limiar.")
