@@ -27,6 +27,7 @@ from core import (
     split_companies_input,
     assistant_explain_row,
 )
+
 from services import (
     parse_transactions_csv,
     parse_baas_csv,
@@ -37,8 +38,9 @@ from services import (
     daily_totals_from_facts,
     top_companies_from_facts,
     zero_and_down_counts_by_day,
+    resolve_webhooks_from_sources,
+    send_discord_reports,
 )
-
 
 # =========================
 # Page config
@@ -299,6 +301,17 @@ with st.sidebar:
     baseline_days = st.number_input("Janela baseline (dias)", value=7, min_value=2, step=1)
     drop_ratio = st.slider("Queda = < X% da baseline", min_value=0.30, max_value=0.95, value=0.70, step=0.05)
 
+    st.divider()
+    st.header("Discord (Webhooks)")
+
+    st.caption("Opcional: se não usar st.secrets/env, cole aqui. (não envia sozinho, só no botão)")
+    wh_zero = st.text_input("Webhook — Zeradas", value="", type="password", key="wh_zero")
+    wh_down = st.text_input("Webhook — Queda", value="", type="password", key="wh_down")
+    wh_block = st.text_input("Webhook — Bloqueio", value="", type="password", key="wh_block")
+
+    top_n_discord = st.selectbox("Top por categoria (Discord)", [20, 40, 60, 100, 150], index=2, key="top_n_discord")
+
+
 thresholds = Thresholds(
     queda_critica=float(queda_critica),
     aumento_relevante=float(aumento_relevante),
@@ -323,6 +336,7 @@ alert_cfg = AlertConfig(
 )
 
 tab_main, tab_alerts, tab_daily, tab_graphs = st.tabs(["Principal", "Alertas", "Análise (Diário)", "Gráficos (Diário)"])
+
 
 
 # =========================
@@ -416,6 +430,51 @@ with tab_main:
         st.metric("Contas com bloqueio", fmt_int_pt(kpi_blocked_accounts))
     with k6:
         st.metric("Soma bloqueada (R$)", fmt_money_pt(kpi_blocked_sum))
+    
+    st.divider()
+    st.subheader("Envio para Discord (manual)")
+
+    # resolve webhooks: manual -> st.secrets -> env
+    manual_hooks = {
+        "DISCORD_WEBHOOK_ZERADAS": st.session_state.get("wh_zero", ""),
+        "DISCORD_WEBHOOK_QUEDA": st.session_state.get("wh_down", ""),
+        "DISCORD_WEBHOOK_BLOQUEIO": st.session_state.get("wh_block", ""),
+    }
+    hooks = resolve_webhooks_from_sources(
+        secrets=getattr(st, "secrets", {}),
+        env=None,
+        manual=manual_hooks,
+    )
+
+    colA, colB = st.columns([1.0, 1.0], gap="small")
+    with colA:
+        send_btn = st.button("Enviar para Discord", use_container_width=True)
+    with colB:
+        st.caption("Usa os alertas da aba **Alertas** (alerts_df) e envia em 3 canais via webhook.")
+
+    if send_btn:
+        if "alerts_df" not in st.session_state:
+            st.error("Você precisa processar primeiro para gerar alerts_df.")
+        else:
+            alerts_df = st.session_state.get("alerts_df", pd.DataFrame())
+            period = str(alerts_df["Periodo"].iloc[0]) if (alerts_df is not None and not alerts_df.empty and "Periodo" in alerts_df.columns) else "—"
+
+            with st.spinner("Enviando para o Discord..."):
+                report = send_discord_reports(
+                    alerts_df=alerts_df,
+                    cfg=alert_cfg,
+                    webhooks={
+                        "ZERADAS": hooks.get("ZERADAS", ""),
+                        "QUEDA": hooks.get("QUEDA", ""),
+                        "BLOQUEIO": hooks.get("BLOQUEIO", ""),
+                    },
+                    period=period,
+                    top_n_each=int(st.session_state.get("top_n_discord", 60)),
+                    username="Checklist Bot",
+                )
+
+            st.success("Envio finalizado. Veja o status abaixo:")
+            st.json(report)
 
     st.divider()
     st.subheader("Visão Geral (semanal)")

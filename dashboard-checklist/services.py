@@ -564,3 +564,314 @@ def zero_and_down_counts_by_day(
     }).sort_values("date_dt").reset_index(drop=True)
 
     return out
+# =========================
+# Discord Webhooks (Alerts)
+# =========================
+import os
+import json
+import time
+from urllib import request as _urlrequest
+from urllib.error import HTTPError, URLError
+
+
+DISCORD_LIMIT = 2000  # hard limit for webhook content
+DISCORD_SAFE = 1900   # keep margin for headers and formatting
+
+
+def _clean_discord_text(s: str) -> str:
+    # evita "@" acidental pingando geral
+    return (s or "").replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+
+
+def _split_discord_chunks(text: str, limit: int = DISCORD_SAFE) -> List[str]:
+    """
+    Split text into chunks under `limit`, preferring line boundaries.
+    """
+    text = _clean_discord_text(text).strip()
+    if not text:
+        return []
+
+    if len(text) <= limit:
+        return [text]
+
+    lines = text.splitlines()
+    chunks: List[str] = []
+    buf: List[str] = []
+    size = 0
+
+    def flush():
+        nonlocal buf, size
+        if buf:
+            chunks.append("\n".join(buf).strip())
+            buf = []
+            size = 0
+
+    for ln in lines:
+        ln = ln.rstrip()
+        add = len(ln) + (1 if buf else 0)
+        if size + add <= limit:
+            buf.append(ln)
+            size += add
+        else:
+            flush()
+            if len(ln) <= limit:
+                buf.append(ln)
+                size = len(ln)
+            else:
+                # linha gigantesca -> quebra seca
+                for i in range(0, len(ln), limit):
+                    chunks.append(ln[i:i+limit])
+
+    flush()
+    return [c for c in chunks if c]
+
+
+def _http_post_json(url: str, payload: dict, timeout: int = 12) -> Tuple[bool, str]:
+    """
+    POST JSON via urllib; handles Discord 429 with retry_after.
+    Returns (ok, message).
+    """
+    data = json.dumps(payload).encode("utf-8")
+    req = _urlrequest.Request(
+        url=url,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": "streamlit-discord-webhook"},
+        method="POST",
+    )
+
+    try:
+        with _urlrequest.urlopen(req, timeout=timeout) as resp:
+            # Discord returns 204 No Content on success
+            if 200 <= resp.status < 300:
+                return True, f"HTTP {resp.status}"
+            return False, f"HTTP {resp.status}"
+    except HTTPError as e:
+        # Discord rate limit
+        if e.code == 429:
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+                j = json.loads(body) if body else {}
+                retry_after = float(j.get("retry_after", 1.0))
+            except Exception:
+                retry_after = 1.0
+            time.sleep(min(max(retry_after, 0.5), 10.0))
+            # try once more
+            try:
+                with _urlrequest.urlopen(req, timeout=timeout) as resp2:
+                    if 200 <= resp2.status < 300:
+                        return True, f"HTTP {resp2.status} (after 429 retry)"
+                    return False, f"HTTP {resp2.status} (after 429 retry)"
+            except Exception as e2:
+                return False, f"429 retry failed: {type(e2).__name__}"
+        return False, f"HTTPError {e.code}"
+    except URLError as e:
+        return False, f"URLError: {e.reason}"
+    except Exception as e:
+        return False, f"Error: {type(e).__name__}"
+
+
+def send_discord_webhook(url: str, content: str, *, username: Optional[str] = None) -> Tuple[bool, str]:
+    """
+    Sends content to Discord webhook. Splits into chunks.
+    """
+    url = (url or "").strip()
+    if not url:
+        return False, "Webhook URL vazia."
+
+    chunks = _split_discord_chunks(content, limit=DISCORD_SAFE)
+    if not chunks:
+        return True, "Sem conteúdo para enviar."
+
+    last_msg = "OK"
+    for i, ch in enumerate(chunks, start=1):
+        payload = {"content": ch}
+        if username:
+            payload["username"] = username
+
+        ok, msg = _http_post_json(url, payload)
+        last_msg = msg
+        if not ok:
+            return False, f"Falha no chunk {i}/{len(chunks)}: {msg}"
+
+        # tiny spacing to be nice with rate limits
+        time.sleep(0.15)
+
+    return True, last_msg
+
+
+def _format_card_from_alert_row(r: pd.Series) -> str:
+    """
+    Row expected from alerts_df (build_alerts).
+    """
+    empresa = str(r.get("Empresa", "—"))
+    conta = str(r.get("Conta", "—"))
+    total = int(r.get("Total_Periodo", 0))
+    ultimo = int(r.get("Ultimo_Dia", 0))
+    freq = float(r.get("Freq_pct", 0.0))
+    media = int(round(total / max(1, len(str(r.get("Periodo", ""))) and 1)))  # fallback
+    # a média diária real depende do nº de dias do CSV; vamos calcular por texto do período se vier,
+    # mas no envio vamos preferir o campo motivo_curto e números principais.
+
+    z = int(r.get("Streak_zero", 0))
+    d = int(r.get("Streak_down", 0))
+    saldo = float(r.get("Saldo", 0.0))
+    bloq = float(r.get("Saldo_Bloqueado", 0.0))
+    motivo = str(r.get("motivo_curto", "OK"))
+
+    lines = []
+    lines.append(f"**{empresa}** | Conta **{conta}**")
+    lines.append(f"- Total período: **{total}** | Último dia: **{ultimo}** | Freq: **{freq:.0f}%**")
+    lines.append(f"- Saldo: **R$ {fmt_money_pt(saldo)}** | Bloqueio: **R$ {fmt_money_pt(bloq)}**")
+    lines.append(f"- Zerado: **{z}d** | Queda: **{d}d**")
+    lines.append(f"- Motivo: {motivo}")
+    return "\n".join(lines)
+
+
+def build_discord_report_messages(
+    alerts_df: pd.DataFrame,
+    cfg: AlertConfig,
+    *,
+    category: str,
+    period: str,
+    top_n: int = 60,
+) -> List[str]:
+    """
+    Builds one or more messages for a category, respecting Discord limits.
+    """
+    if alerts_df is None or alerts_df.empty:
+        return [f"**[{category}]** Sem dados no período {period}."]
+
+    df = alerts_df.copy()
+
+    if category == "ZERADAS":
+        df = df[df["Streak_zero"] >= int(cfg.zero_yellow)].copy()
+        df = df.sort_values(["Streak_zero", "score"], ascending=[False, False])
+        rule = f"Regra: Streak_zero ≥ {int(cfg.zero_yellow)}d"
+    elif category == "QUEDA":
+        df = df[df["Streak_down"] >= int(cfg.down_yellow)].copy()
+        df = df.sort_values(["Streak_down", "score"], ascending=[False, False])
+        rule = f"Regra: Streak_down ≥ {int(cfg.down_yellow)}d (baseline {cfg.baseline_days}d, drop<{int(cfg.drop_ratio*100)}%)"
+    elif category == "BLOQUEIO":
+        df = df[df["Saldo_Bloqueado"] >= float(cfg.block_yellow)].copy()
+        df = df.sort_values(["Saldo_Bloqueado", "score"], ascending=[False, False])
+        rule = f"Regra: Bloqueio ≥ R$ {fmt_money_pt(float(cfg.block_yellow))}"
+    else:
+        rule = "Regra: —"
+
+    if df.empty:
+        return [f"**[{category}]** Nenhum caso (período {period}).\n{rule}"]
+
+    df = df.head(int(top_n)).copy()
+
+    header = (
+        f"**[{category}]** | Período: {period}\n"
+        f"{rule}\n"
+        f"Total na lista: **{len(df)}**\n"
+        f"---"
+    )
+
+    cards = []
+    for _, r in df.iterrows():
+        cards.append(_format_card_from_alert_row(r))
+        cards.append("---")
+
+    full = header + "\n" + "\n".join(cards).strip()
+    return _split_discord_chunks(full, limit=DISCORD_SAFE)
+
+
+def resolve_webhooks_from_sources(
+    *,
+    secrets: Optional[dict] = None,
+    env: Optional[dict] = None,
+    manual: Optional[dict] = None,
+) -> Dict[str, str]:
+    """
+    Returns dict with keys: ZERADAS, QUEDA, BLOQUEIO.
+    Priority: manual -> secrets -> env
+    Expected secret/env names:
+      DISCORD_WEBHOOK_ZERADAS
+      DISCORD_WEBHOOK_QUEDA
+      DISCORD_WEBHOOK_BLOQUEIO
+    """
+    secrets = secrets or {}
+    env = env or os.environ
+    manual = manual or {}
+
+    def pick(key: str) -> str:
+        # manual first
+        v = (manual.get(key) or "").strip()
+        if v:
+            return v
+        # secrets
+        v = (secrets.get(key) if isinstance(secrets, dict) else None) or ""
+        v = str(v).strip()
+        if v:
+            return v
+        # env
+        v = str(env.get(key, "") or "").strip()
+        return v
+
+    return {
+        "ZERADAS": pick("DISCORD_WEBHOOK_ZERADAS"),
+        "QUEDA": pick("DISCORD_WEBHOOK_QUEDA"),
+        "BLOQUEIO": pick("DISCORD_WEBHOOK_BLOQUEIO"),
+    }
+
+
+def send_discord_reports(
+    alerts_df: pd.DataFrame,
+    cfg: AlertConfig,
+    *,
+    webhooks: Dict[str, str],
+    period: str,
+    top_n_each: int = 60,
+    username: str = "Checklist Bot",
+) -> Dict[str, object]:
+    """
+    Sends 3 category reports to their respective webhooks.
+    Returns stats dict.
+    """
+    result = {
+        "sent": {},
+        "errors": {},
+        "counts": {},
+    }
+
+    for cat, hook_key in [("ZERADAS", "ZERADAS"), ("QUEDA", "QUEDA"), ("BLOQUEIO", "BLOQUEIO")]:
+        url = (webhooks.get(hook_key) or "").strip()
+        msgs = build_discord_report_messages(
+            alerts_df=alerts_df,
+            cfg=cfg,
+            category=cat,
+            period=period,
+            top_n=int(top_n_each),
+        )
+
+        # count items for UX (rough: number of cards = occurrences of "**" header in cards, but we can do df filter)
+        if cat == "ZERADAS":
+            cnt = int((alerts_df["Streak_zero"] >= int(cfg.zero_yellow)).sum()) if alerts_df is not None and not alerts_df.empty else 0
+        elif cat == "QUEDA":
+            cnt = int((alerts_df["Streak_down"] >= int(cfg.down_yellow)).sum()) if alerts_df is not None and not alerts_df.empty else 0
+        else:
+            cnt = int((alerts_df["Saldo_Bloqueado"] >= float(cfg.block_yellow)).sum()) if alerts_df is not None and not alerts_df.empty else 0
+        result["counts"][cat] = cnt
+
+        if not url:
+            result["errors"][cat] = "Webhook não configurado."
+            continue
+
+        ok_all = True
+        last_msg = "OK"
+        for m in msgs:
+            ok, msg = send_discord_webhook(url, m, username=username)
+            last_msg = msg
+            if not ok:
+                ok_all = False
+                break
+
+        if ok_all:
+            result["sent"][cat] = f"OK ({len(msgs)} msg) — {last_msg}"
+        else:
+            result["errors"][cat] = f"Falhou — {last_msg}"
+
+    return result
