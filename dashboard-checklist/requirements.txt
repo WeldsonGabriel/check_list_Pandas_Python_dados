@@ -1,6 +1,5 @@
-streamlit
-pandas
-numpy
-plotly
-unidecode
-requests
+streamlit>=1.36.0
+pandas>=2.2.2
+numpy>=1.26.4
+plotly>=5.22.0
+plotly>=5.22.0
