@@ -1534,96 +1534,116 @@ with tab_main:
 
 
 # =========================
-# ALERTAS (DIÁRIO)
+# HÁBITOS — ZABBIX FINANCEIRO
 # =========================
 with tab_alerts:
-    if "alerts_df" not in st.session_state:
+    if "alerts_df" not in st.session_state or "daily_table" not in st.session_state:
         st.info("Você precisa processar na aba Principal primeiro.")
         st.stop()
 
-    alerts_df = st.session_state.get("alerts_df", pd.DataFrame())
-    if alerts_df is None or alerts_df.empty:
-        st.info("Sem alertas diários para mostrar (ou sem dados suficientes).")
-        st.stop()
+    alerts_df = st.session_state["alerts_df"]
+    daily_table = st.session_state["daily_table"]
 
-    st.subheader("Alertas (Diário) — farol por conta")
-    st.caption("Ordenado do pior → melhor. Use filtros para focar em empresa/conta.")
+    st.subheader("Hábitos — Monitoramento Financeiro (estilo Zabbix)")
 
-    companies = ["TOTAL GERAL"] + sorted(alerts_df["Empresa"].dropna().astype(str).unique().tolist())
+    # =====================
+    # KPIs para Grounds
+    # =====================
+    total_transacoes = int(alerts_df["Total_Periodo"].sum())
+    total_bloqueado = float(alerts_df["Saldo_Bloqueado"].sum())
+    contas_zeradas = int((alerts_df["Streak_zero"] > 0).sum())
+    contas_queda = int((alerts_df["Streak_down"] > 0).sum())
 
-    c1, c2, c3 = st.columns([1.2, 1.0, 0.8], gap="small")
-    with c1:
-        sel_emp = st.selectbox("Empresa (filtro)", companies, index=0, key="alerts_emp")
-    with c2:
-        q_emp = st.text_input("Buscar por nome", value="", key="alerts_q_emp")
-    with c3:
-        q_acc = st.text_input("Buscar por conta", value="", key="alerts_q_acc")
+    freq_media = float(alerts_df["Freq_pct"].mean())
 
-    v = alerts_df.copy()
-    if sel_emp != "TOTAL GERAL":
-        v = v[v["Empresa"] == sel_emp].copy()
-    if q_emp.strip():
-        q = q_emp.strip().lower()
-        v = v[v["Empresa"].astype(str).str.lower().str.contains(q, na=False)]
-    if q_acc.strip():
-        q = re.sub(r"\D+", "", q_acc.strip())
-        if q:
-            v = v[v["Conta"].astype(str).str.contains(q, na=False)]
+    day_cols = [c for c in daily_table.columns if isinstance(c, pd.Timestamp)]
+    media_diaria = int(daily_table[day_cols].sum(axis=0).mean()) if day_cols else 0
 
-    # KPIs de topo (diário)
-    day_ref = st.session_state.get("day_ref", "—")
-    total_accounts = int(len(v))
-    zero_now = int((v["Streak_zero"] > 0).sum())
-    block_now = int((v["Saldo_Bloqueado"] > 0).sum())
+    g1, g2, g3, g4, g5, g6 = st.columns(6)
 
-    k1, k2, k3, k4 = st.columns(4, gap="small")
-    with k1:
-        st.metric("Day_ref (semanal)", day_ref)
-    with k2:
-        st.metric("Contas no escopo", fmt_int_pt(total_accounts))
-    with k3:
-        st.metric("Contas com streak zerado", fmt_int_pt(zero_now))
-    with k4:
-        st.metric("Contas com bloqueio", fmt_int_pt(block_now))
+    with g1: st.metric("Total Transações", fmt_int_pt(total_transacoes))
+    with g2: st.metric("Bloqueado (R$)", fmt_money_pt(total_bloqueado))
+    with g3: st.metric("Contas Zeradas", fmt_int_pt(contas_zeradas))
+    with g4: st.metric("Contas em Queda", fmt_int_pt(contas_queda))
+    with g5: st.metric("Frequência Média", f"{freq_media:.0f}%")
+    with g6: st.metric("Média Diária", fmt_int_pt(media_diaria))
 
     st.divider()
 
-    if v.empty:
-        st.info("Sem resultados para os filtros.")
-        st.stop()
+    # =====================
+    # Filtros
+    # =====================
+    empresas = ["TOTAL GERAL"] + sorted(alerts_df["Empresa"].unique().tolist())
 
-    # Render cards
-    for _, r in v.iterrows():
-        empresa = r["Empresa"]
-        conta = r["Conta"]
+    f1, f2, f3 = st.columns([1.2, 1.0, 0.8])
+    with f1:
+        sel_emp = st.selectbox("Empresa", empresas, 0)
+    with f2:
+        busca_nome = st.text_input("Buscar empresa")
+    with f3:
+        busca_conta = st.text_input("Buscar conta")
 
-        title = f"{empresa} | Conta {conta}"
-        subtitle = str(r.get("motivo_curto", "OK"))
+    view = alerts_df.copy()
 
-        with st.expander(f"{title} — {subtitle}", expanded=False):
-            st.markdown('<div class="badges">', unsafe_allow_html=True)
+    if sel_emp != "TOTAL GERAL":
+        view = view[view["Empresa"] == sel_emp]
 
-            render_badge("Zerado (tail)", f"{int(r['Streak_zero'])}d", str(r["tone_zero"]))
-            render_badge("Queda (tail)", f"{int(r['Streak_down'])}d", str(r["tone_down"]))
-            render_badge("Bloqueio", f"R$ {fmt_money_pt(float(r['Saldo_Bloqueado']))}", str(r["tone_block"]))
-            render_badge("Frequência", f"{float(r['Freq_pct']):.0f}%", str(r["tone_freq"]))
+    if busca_nome:
+        view = view[view["Empresa"].str.lower().str.contains(busca_nome.lower())]
 
-            st.markdown("</div>", unsafe_allow_html=True)
+    if busca_conta:
+        view = view[view["Conta"].astype(str).str.contains(busca_conta)]
 
-            # detalhes rápidos
-            d1, d2, d3, d4 = st.columns(4, gap="small")
-            with d1:
-                st.metric("Total período", fmt_int_pt(int(r["Total_Periodo"])))
-            with d2:
-                st.metric("Último dia", fmt_int_pt(int(r["Ultimo_Dia"])))
-            with d3:
-                st.metric("Saldo (R$)", fmt_money_pt(float(r["Saldo"])))
-            with d4:
-                st.metric("Baseline (7d)", fmt_int_pt(int(round(float(r["Baseline"])))))
+    view = view.sort_values("score", ascending=False)
 
-            st.markdown("**Resumo determinístico (assistente):**")
-            st.markdown(assistant_explain_row(r, alert_cfg))
+    # =====================
+    # Função de cor translúcida
+    # =====================
+    def bg_color(tone):
+        return {
+            "red": "rgba(231,76,60,0.18)",
+            "orange": "rgba(230,126,34,0.18)",
+            "yellow": "rgba(241,196,15,0.18)",
+            "green": "rgba(46,204,113,0.18)",
+            "gray": "rgba(170,180,200,0.10)",
+        }.get(tone, "rgba(170,180,200,0.08)")
 
+    # =====================
+    # CARDS ESTILO ZABBIX
+    # =====================
+    cols = st.columns(4)
+
+    for i, (_, r) in enumerate(view.iterrows()):
+        with cols[i % 4]:
+            tone = max(
+                [r["tone_zero"], r["tone_down"], r["tone_block"], r["tone_freq"]],
+                key=lambda x: {"red":4,"orange":3,"yellow":2,"gray":1,"green":0}.get(x,0)
+            )
+
+            st.markdown(
+                f"""
+                <div style="
+                    background:{bg_color(tone)};
+                    padding:14px;
+                    border-radius:14px;
+                    border:1px solid rgba(255,255,255,0.15);
+                    margin-bottom:12px;
+                ">
+                <strong>{r['Empresa']}</strong><br>
+                Conta {r['Conta']}<br><br>
+
+                Total: {fmt_int_pt(r['Total_Periodo'])}<br>
+                Último dia: {fmt_int_pt(r['Ultimo_Dia'])}<br>
+                Frequência: {r['Freq_pct']:.0f}%<br>
+                Média diária: {int(r['Total_Periodo']/max(1,len(day_cols)))}<br>
+                Saldo: R$ {fmt_money_pt(r['Saldo'])}<br>
+                Bloqueio: R$ {fmt_money_pt(r['Saldo_Bloqueado'])}<br>
+
+                Zerado: {r['Streak_zero']}d | Queda: {r['Streak_down']}d
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
 # =========================
 # ANÁLISE (DIÁRIO)
