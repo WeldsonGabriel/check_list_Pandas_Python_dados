@@ -43,6 +43,21 @@ from services import (
 )
 
 # =========================
+# Secrets safe loader (BUGFIX)
+# =========================
+def _get_streamlit_secrets_safe() -> dict:
+    """
+    st.secrets pode levantar StreamlitSecretNotFoundError se não existir secrets.toml
+    (local) ou se não tiver secrets configurado no Streamlit Cloud.
+    Aqui a gente garante que isso nunca derruba o app.
+    """
+    try:
+        return dict(st.secrets)
+    except Exception:
+        return {}
+
+
+# =========================
 # Page config
 # =========================
 st.set_page_config(page_title="Checklist Semanas + BaaS", layout="wide")
@@ -430,18 +445,18 @@ with tab_main:
         st.metric("Contas com bloqueio", fmt_int_pt(kpi_blocked_accounts))
     with k6:
         st.metric("Soma bloqueada (R$)", fmt_money_pt(kpi_blocked_sum))
-    
+
     st.divider()
     st.subheader("Envio para Discord (manual)")
 
-    # resolve webhooks: manual -> st.secrets -> env
     manual_hooks = {
         "DISCORD_WEBHOOK_ZERADAS": st.session_state.get("wh_zero", ""),
         "DISCORD_WEBHOOK_QUEDA": st.session_state.get("wh_down", ""),
         "DISCORD_WEBHOOK_BLOQUEIO": st.session_state.get("wh_block", ""),
     }
+
     hooks = resolve_webhooks_from_sources(
-        secrets=getattr(st, "secrets", {}),
+        secrets=_get_streamlit_secrets_safe(),  # ✅ BUGFIX aqui
         env=None,
         manual=manual_hooks,
     )
@@ -622,7 +637,7 @@ with tab_main:
 
 
 # =========================
-# ALERTAS (HÁBITOS / ZABBIX FINANCEIRO)
+# ALERTAS
 # =========================
 with tab_alerts:
     if "alerts_df" not in st.session_state or "daily_table" not in st.session_state:
@@ -634,7 +649,6 @@ with tab_alerts:
 
     st.subheader("Hábitos — Monitoramento Financeiro (estilo Zabbix)")
 
-    # KPIs (inclui freq e média, como pedido)
     total_transacoes = int(alerts_df["Total_Periodo"].sum()) if not alerts_df.empty else 0
     total_bloqueado = float(alerts_df["Saldo_Bloqueado"].sum()) if not alerts_df.empty else 0.0
     contas_zeradas = int((alerts_df["Streak_zero"] > 0).sum()) if not alerts_df.empty else 0
