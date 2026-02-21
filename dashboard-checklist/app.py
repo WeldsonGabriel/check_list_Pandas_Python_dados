@@ -47,6 +47,7 @@ from services import (
     build_card_images_from_alerts,
     send_card_images_to_discord,
     discord_send_single_image,
+    make_top10_table_png,
 )
 
 
@@ -735,7 +736,7 @@ with tab_main:
                 f"🔵 {counts_week['Gerenciar (aumento)']} | "
                 f"🟢 {counts_week['Normal']}\n"
                 f"**Bloqueios:** {fmt_int_pt(int(kpi_blocked_accounts))} conta(s) | **R$ {fmt_money_pt(float(kpi_blocked_sum))}**\n"
-                f"**NORMAL:** cards PNG enviados neste canal (1 por mensagem)."
+                f"**Inclui:** 4 gráficos PNG + 1 tabela Top 10 (PNG)."
             )
 
             with st.spinner("Gerando e enviando Snapshot (1 por vez)..."):
@@ -774,25 +775,27 @@ with tab_main:
                         st.error(f"Falha ao enviar gráfico {fname}: {msg}")
                         st.stop()
 
-                # 4) NORMAL -> cards PNG no snapshot
-                normal_imgs = build_card_images_from_alerts(
+                # 4) TOP 10 (tabela PNG) — substitui NORMAL
+                top10_png = make_top10_table_png(
                     alerts_df=alerts_df,
-                    category="NORMAL",
-                    cfg=alert_cfg,
-                    n_days=n_days,
-                    top_n=int(st.session_state.get("top_n_discord", 60)),
-                )
-                normal_report = send_card_images_to_discord(
-                    snapshot_hook,
-                    description=desc,
-                    images=normal_imgs,
-                    username="Checklist Bot",
+                    top_n=10,
+                    order_by="Ultimo_Dia",
                 )
 
-            if normal_report.get("errors"):
-                st.warning(f"Snapshot OK (gráficos), mas NORMAL teve erro: {normal_report.get('errors')}")
-            else:
-                st.success(f"Snapshot enviado + NORMAL: {normal_report.get('sent',0)} card(s).")
+                ok, msg = discord_send_single_image(
+                    snapshot_hook,
+                    description=desc,
+                    filename="05 - Top 10 Empresas (tabela).png",
+                    png_bytes=top10_png,
+                    title="5) Top 10 empresas (último dia) — tabela",
+                    username="Checklist Bot",
+                )
+                if not ok:
+                    st.error(f"Falha ao enviar tabela Top 10: {msg}")
+                    st.stop()
+
+            st.success("Snapshot enviado (texto + 4 gráficos + Top 10 tabela).")
+
 
     st.divider()
     st.subheader("Visão Geral (semanal)")

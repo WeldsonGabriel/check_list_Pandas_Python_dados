@@ -1316,3 +1316,134 @@ def build_daily_dashboard_images(
     images.append(("04 - Queda por dia.png", img4))
 
     return images
+    
+def _fmt_int_pt(n: int) -> str:
+    try:
+        return f"{int(n):,}".replace(",", ".")
+    except Exception:
+        return "0"
+
+
+def make_top10_table_png(
+    alerts_df: pd.DataFrame,
+    *,
+    top_n: int = 10,
+    order_by: str = "Ultimo_Dia",  # ou "Total_Periodo"
+    figsize: Tuple[float, float] = (10.5, 3.8),
+    dpi: int = 160,
+) -> bytes:
+    """
+    PNG com tabela Top N:
+      Empresa | Saldo | Saldo Bloqueado | Transações último dia
+    """
+    # Segurança: imports usados aqui
+    import io
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    # Dependências do seu projeto (já existem no arquivo services.py)
+    # - fmt_money_pt: formata float em pt-BR ("1.234,56")
+    # - _fmt_int_pt: helper local do services.py (formata int com separador ".")
+
+    if alerts_df is None or alerts_df.empty:
+        fig = plt.figure(figsize=figsize)
+        ax = fig.add_subplot(111)
+        ax.set_axis_off()
+        fig.patch.set_facecolor((0.08, 0.09, 0.11))
+        ax.text(
+            0.02, 0.92, "TOP 10 — Sem dados",
+            transform=ax.transAxes, fontsize=14, fontweight="bold", color="white"
+        )
+        ax.text(
+            0.02, 0.80, "alerts_df vazio.",
+            transform=ax.transAxes, fontsize=11, color="white", alpha=0.85
+        )
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        return buf.getvalue()
+
+    df = alerts_df.copy()
+
+    # garante colunas mínimas
+    for c in ["Empresa", "Ultimo_Dia", "Total_Periodo", "Saldo", "Saldo_Bloqueado"]:
+        if c not in df.columns:
+            df[c] = 0
+
+    metric_col = order_by if order_by in df.columns else "Ultimo_Dia"
+
+    # agrega por empresa (somando contas)
+    g = (
+        df.groupby("Empresa", as_index=False)
+        .agg(
+            tx_last=("Ultimo_Dia", "sum"),
+            tx_total=("Total_Periodo", "sum"),
+            saldo=("Saldo", "sum"),
+            bloq=("Saldo_Bloqueado", "sum"),
+        )
+    )
+
+    # ordenação
+    if metric_col == "Total_Periodo":
+        g = g.sort_values("tx_total", ascending=False)
+    else:
+        g = g.sort_values("tx_last", ascending=False)
+
+    g = g.head(int(top_n)).copy()
+
+    # monta linhas (4 colunas, sem cadeado)
+    rows = []
+    for _, r in g.iterrows():
+        rows.append([
+            str(r["Empresa"]),
+            f"R$ {fmt_money_pt(float(r['saldo']))}",
+            f"R$ {fmt_money_pt(float(r['bloq']))}",
+            _fmt_int_pt(int(r["tx_last"])),
+        ])
+
+    col_labels = ["Empresa", "Saldo", "Saldo Bloqueado", "Transações último dia"]
+
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111)
+    ax.set_axis_off()
+    fig.patch.set_facecolor((0.08, 0.09, 0.11))
+
+    title = f"TOP {min(int(top_n), len(rows))} — Empresas por Transações no último dia"
+    ax.text(
+        0.02, 0.95, title,
+        transform=ax.transAxes, fontsize=14, fontweight="bold", color="white", va="top"
+    )
+    ax.text(
+        0.02, 0.89, f"Ordenação: {metric_col}",
+        transform=ax.transAxes, fontsize=10.5, color="white", alpha=0.85, va="top"
+    )
+
+    table = ax.table(
+        cellText=rows,
+        colLabels=col_labels,
+        loc="upper left",
+        colLoc="left",
+        cellLoc="left",
+        bbox=[0.02, 0.04, 0.96, 0.80],
+    )
+
+    table.auto_set_font_size(False)
+    table.set_fontsize(10.2)
+
+    for (row, col), cell in table.get_celld().items():
+        cell.set_linewidth(0.6)
+        cell.set_edgecolor((1, 1, 1, 0.12))
+        if row == 0:
+            cell.set_facecolor((0.15, 0.17, 0.20))
+            cell.get_text().set_color("white")
+            cell.get_text().set_fontweight("bold")
+        else:
+            cell.set_facecolor((0.10, 0.11, 0.13))
+            cell.get_text().set_color("white")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
