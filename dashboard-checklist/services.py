@@ -15,6 +15,7 @@ from urllib import request as _urlrequest
 from urllib.error import HTTPError, URLError
 
 import matplotlib.pyplot as plt
+from matplotlib.patches import FancyBboxPatch
 
 try:
     import requests
@@ -580,7 +581,7 @@ def zero_and_down_counts_by_day(
 
 
 # =========================
-# Discord Webhooks (Alerts - texto)
+# Discord Webhooks (Alerts - texto)  [mantido]
 # =========================
 DISCORD_LIMIT = 2000  # hard limit for webhook content
 DISCORD_SAFE = 1900   # keep margin for headers and formatting
@@ -626,7 +627,6 @@ def _split_discord_chunks(text: str, limit: int = DISCORD_SAFE) -> List[str]:
                 buf.append(ln)
                 size = len(ln)
             else:
-                # linha gigantesca -> quebra seca
                 for i in range(0, len(ln), limit):
                     chunks.append(ln[i:i+limit])
 
@@ -649,12 +649,10 @@ def _http_post_json(url: str, payload: dict, timeout: int = 12) -> Tuple[bool, s
 
     try:
         with _urlrequest.urlopen(req, timeout=timeout) as resp:
-            # Discord returns 204 No Content on success
             if 200 <= resp.status < 300:
                 return True, f"HTTP {resp.status}"
             return False, f"HTTP {resp.status}"
     except HTTPError as e:
-        # Discord rate limit
         if e.code == 429:
             try:
                 body = e.read().decode("utf-8", errors="replace")
@@ -663,7 +661,6 @@ def _http_post_json(url: str, payload: dict, timeout: int = 12) -> Tuple[bool, s
             except Exception:
                 retry_after = 1.0
             time.sleep(min(max(retry_after, 0.5), 10.0))
-            # try once more
             try:
                 with _urlrequest.urlopen(req, timeout=timeout) as resp2:
                     if 200 <= resp2.status < 300:
@@ -701,16 +698,334 @@ def send_discord_webhook(url: str, content: str, *, username: Optional[str] = No
         if not ok:
             return False, f"Falha no chunk {i}/{len(chunks)}: {msg}"
 
-        # tiny spacing to be nice with rate limits
         time.sleep(0.15)
 
     return True, last_msg
 
 
+# =========================
+# Discord Webhook (Imagens / Cards PNG) — NOVO (1 por mensagem)
+# =========================
+def _requests_post_with_429(url: str, *, files: dict, timeout: int = 40) -> Tuple[bool, str]:
+    """
+    POST multipart via requests, com retry simples em 429 (Discord).
+    """
+    if requests is None:
+        return False, "Dependência ausente: requests (pip install requests)."
+
+    try:
+        r = requests.post(url, files=files, timeout=timeout)
+        if r.status_code == 429:
+            try:
+                j = r.json()
+                retry_after = float(j.get("retry_after", 1.0))
+            except Exception:
+                retry_after = 1.0
+            time.sleep(min(max(retry_after, 0.5), 10.0))
+            r = requests.post(url, files=files, timeout=timeout)
+
+        if 200 <= r.status_code < 300:
+            return True, f"HTTP {r.status_code}"
+        return False, f"HTTP {r.status_code}: {str(r.text)[:300]}"
+    except Exception as e:
+        return False, f"Erro: {type(e).__name__}: {e}"
+
+
+def discord_send_single_image(
+    webhook_url: str,
+    *,
+    description: str,
+    filename: str,
+    png_bytes: bytes,
+    title: Optional[str] = None,
+    username: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """
+    Envia 1 imagem PNG em 1 mensagem, SEMPRE com description no embed.
+    (Isso resolve o problema do cabeçalho sumir quando manda em batch.)
+    """
+    webhook_url = (webhook_url or "").strip()
+    if not webhook_url:
+        return False, "Webhook não configurado."
+    if not png_bytes:
+        return False, "PNG vazio."
+
+    safe_desc = _clean_discord_text(description or "")
+
+    embeds = [{
+        "title": title or filename.replace(".png", ""),
+        "description": safe_desc,
+        "image": {"url": f"attachment://{filename}"},
+        "type": "rich",
+    }]
+
+    payload = {"embeds": embeds}
+    if username:
+        payload["username"] = username
+
+    files = {
+        "payload_json": (None, json.dumps(payload, ensure_ascii=False), "application/json"),
+        filename: (filename, png_bytes, "image/png"),
+    }
+
+    return _requests_post_with_429(webhook_url, files=files, timeout=40)
+
+
+# =========================
+# Cards PNG (Matplotlib) — NOVO
+# =========================
+def _tone_rank() -> Dict[str, int]:
+    return {"red": 4, "orange": 3, "yellow": 2, "gray": 1, "green": 0}
+
+
+def _pick_row_tone(r: pd.Series) -> str:
+    """
+    Pega o pior tom entre as dimensões (zero/down/block/freq).
+    """
+    tr = _tone_rank()
+    tones = [str(r.get("tone_zero", "gray")), str(r.get("tone_down", "gray")),
+             str(r.get("tone_block", "gray")), str(r.get("tone_freq", "gray"))]
+    return max(tones, key=lambda t: tr.get(t, 0))
+
+
+def _bg_by_tone(tone: str) -> Tuple[float, float, float, float]:
+    # cores próximas da UI do app (escuro, com “tinta” leve)
+    return {
+        "red": (0.35, 0.10, 0.12, 0.85),
+        "orange": (0.35, 0.22, 0.10, 0.85),
+        "yellow": (0.32, 0.30, 0.10, 0.85),
+        "green": (0.10, 0.28, 0.18, 0.85),
+        "gray": (0.20, 0.22, 0.26, 0.75),
+    }.get(str(tone), (0.20, 0.22, 0.26, 0.75))
+
+
+def _fmt_int_pt(n: int) -> str:
+    try:
+        return f"{int(n):,}".replace(",", ".")
+    except Exception:
+        return "0"
+
+
+def make_alert_card_png(
+    r: pd.Series,
+    *,
+    title: Optional[str] = None,
+    figsize: Tuple[float, float] = (6.2, 3.0),
+    dpi: int = 160,
+) -> bytes:
+    """
+    Gera 1 card PNG (estilo aba Alertas), para enviar no Discord.
+    """
+    empresa = str(r.get("Empresa", "—"))
+    conta = str(r.get("Conta", "—"))
+
+    total = int(r.get("Total_Periodo", 0))
+    ultimo = int(r.get("Ultimo_Dia", 0))
+    freq = float(r.get("Freq_pct", 0.0))
+  
+    saldo = float(r.get("Saldo", 0.0))
+    bloq = float(r.get("Saldo_Bloqueado", 0.0))
+    z = int(r.get("Streak_zero", 0))
+    d = int(r.get("Streak_down", 0))
+
+    tone = _pick_row_tone(r)
+    bg = _bg_by_tone(tone)
+
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111)
+    ax.set_axis_off()
+
+    # fundo arredondado
+    pad = 0.02
+    rect = FancyBboxPatch(
+        (pad, pad),
+        1 - 2 * pad,
+        1 - 2 * pad,
+        boxstyle="round,pad=0.02,rounding_size=0.06",
+        linewidth=1.2,
+        edgecolor=(1, 1, 1, 0.18),
+        facecolor=bg,
+        transform=ax.transAxes,
+        clip_on=False,
+    )
+    ax.add_patch(rect)
+
+    # texto
+    x0 = 0.06
+    y = 0.90
+
+    head = title or empresa
+    ax.text(x0, y, head, transform=ax.transAxes, fontsize=14, fontweight="bold", color="white", va="top")
+    y -= 0.11
+    ax.text(x0, y, f"Conta {conta}", transform=ax.transAxes, fontsize=11.5, fontweight="bold", color="white", va="top")
+    y -= 0.14
+
+    # linhas (mantém o “shape” do seu card)
+    lines = [
+    f"Total: {_fmt_int_pt(total)}",
+    f"Último dia: {_fmt_int_pt(ultimo)}",
+    f"Frequência: {freq:.0f}%",
+    f"Saldo: R$ {fmt_money_pt(saldo)}",
+    f"Bloqueio: R$ {fmt_money_pt(bloq)}",
+    f"Zerado: {z}d | Queda: {d}d",
+]
+
+    for ln in lines:
+        ax.text(x0, y, ln, transform=ax.transAxes, fontsize=11, color="white", va="top")
+        y -= 0.095
+
+    fig.tight_layout(pad=0.2)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", facecolor="none")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def build_card_images_from_alerts(
+    alerts_df: pd.DataFrame,
+    *,
+    category: str,
+    cfg: AlertConfig,
+    n_days: Optional[int] = None,
+    top_n: int = 120,
+) -> List[Tuple[str, bytes]]:
+    """
+    category: ZERADAS | QUEDA | BLOQUEIO | NORMAL
+    Retorna lista [(filename, png_bytes)].
+    """
+    if alerts_df is None or alerts_df.empty:
+        return []
+
+    df = alerts_df.copy()
+
+    if category == "ZERADAS":
+        df = df[df["Streak_zero"] >= int(cfg.zero_yellow)].copy()
+        df = df.sort_values(["Streak_zero", "score"], ascending=[False, False])
+    elif category == "QUEDA":
+        df = df[df["Streak_down"] >= int(cfg.down_yellow)].copy()
+        df = df.sort_values(["Streak_down", "score"], ascending=[False, False])
+    elif category == "BLOQUEIO":
+        df = df[df["Saldo_Bloqueado"] >= float(cfg.block_yellow)].copy()
+        df = df.sort_values(["Saldo_Bloqueado", "score"], ascending=[False, False])
+    elif category == "NORMAL":
+        # “normal” = não dispara nenhum dos 3 gatilhos
+        m = (
+            (df["Streak_zero"] < int(cfg.zero_yellow))
+            & (df["Streak_down"] < int(cfg.down_yellow))
+            & (df["Saldo_Bloqueado"] < float(cfg.block_yellow))
+        )
+        df = df[m].copy()
+        df = df.sort_values(["score", "Empresa", "Conta"], ascending=[False, True, True])
+    else:
+        return []
+
+    if df.empty:
+        return []
+
+    df = df.head(int(top_n)).copy()
+    if n_days is not None:
+        df["_n_days"] = int(n_days)
+
+    images: List[Tuple[str, bytes]] = []
+    for i, (_, r) in enumerate(df.iterrows(), start=1):
+        emp = str(r.get("Empresa", "—")).strip()
+        acc = str(r.get("Conta", "—")).strip()
+        fname = f"{category} - {i:03d} - {emp} - {acc}.png"
+        # limita tamanho do filename
+        fname = re.sub(r"[^\w\-\.\s\(\)\[\]]+", "", fname)[:140].strip()
+        if not fname.endswith(".png"):
+            fname += ".png"
+
+        png = make_alert_card_png(r)
+        images.append((fname, png))
+
+    return images
+
+
+def send_card_images_to_discord(
+    webhook_url: str,
+    *,
+    description: str,
+    images: Sequence[Tuple[str, bytes]],
+    username: str = "Checklist Bot",
+    sleep_s: float = 0.25,
+) -> Dict[str, object]:
+    """
+    Envia 1 card PNG por mensagem (sempre com description/cabeçalho).
+    """
+    out: Dict[str, object] = {"sent": 0, "errors": [], "last": ""}
+
+    if not webhook_url:
+        out["errors"].append("Webhook não configurado.")
+        return out
+
+    if not images:
+        out["last"] = "Sem imagens."
+        return out
+
+    for i, (fname, png) in enumerate(images, start=1):
+        ok, msg = discord_send_single_image(
+            webhook_url,
+            description=description,
+            filename=fname,
+            png_bytes=png,
+            title=fname.replace(".png", ""),
+            username=username,
+        )
+        out["last"] = msg
+        if not ok:
+            out["errors"].append(f"Falha {i}/{len(images)}: {msg}")
+            break
+        out["sent"] = int(out["sent"]) + 1
+        time.sleep(max(0.0, float(sleep_s)))
+
+    return out
+
+
+# =========================
+# Resolver (webhooks)
+# =========================
+def resolve_webhooks_from_sources(
+    *,
+    secrets: Optional[dict] = None,
+    env: Optional[dict] = None,
+    manual: Optional[dict] = None,
+) -> Dict[str, str]:
+    """
+    Returns dict with keys: ZERADAS, QUEDA, BLOQUEIO, SNAPSHOT.
+    Priority: manual -> secrets -> env
+    Expected secret/env names:
+      DISCORD_WEBHOOK_ZERADAS
+      DISCORD_WEBHOOK_QUEDA
+      DISCORD_WEBHOOK_BLOQUEIO
+      DISCORD_WEBHOOK_SNAPSHOT
+    """
+    secrets = secrets or {}
+    env = env or os.environ
+    manual = manual or {}
+
+    def pick(key: str) -> str:
+        v = (manual.get(key) or "").strip()
+        if v:
+            return v
+        v = (secrets.get(key) if isinstance(secrets, dict) else None) or ""
+        v = str(v).strip()
+        if v:
+            return v
+        return str(env.get(key, "") or "").strip()
+
+    return {
+        "ZERADAS": pick("DISCORD_WEBHOOK_ZERADAS"),
+        "QUEDA": pick("DISCORD_WEBHOOK_QUEDA"),
+        "BLOQUEIO": pick("DISCORD_WEBHOOK_BLOQUEIO"),
+        "SNAPSHOT": pick("DISCORD_WEBHOOK_SNAPSHOT"),
+    }
+
+
+# =========================
+# (Mantido) envio antigo em texto — pode remover depois
+# =========================
 def _format_card_from_alert_row(r: pd.Series) -> str:
-    """
-    Row expected from alerts_df (build_alerts).
-    """
     empresa = str(r.get("Empresa", "—"))
     conta = str(r.get("Conta", "—"))
     total = int(r.get("Total_Periodo", 0))
@@ -740,9 +1055,6 @@ def build_discord_report_messages(
     period: str,
     top_n: int = 60,
 ) -> List[str]:
-    """
-    Builds one or more messages for a category, respecting Discord limits.
-    """
     if alerts_df is None or alerts_df.empty:
         return [f"**[{category}]** Sem dados no período {period}."]
 
@@ -783,41 +1095,6 @@ def build_discord_report_messages(
     full = header + "\n" + "\n".join(cards).strip()
     return _split_discord_chunks(full, limit=DISCORD_SAFE)
 
-def resolve_webhooks_from_sources(
-    *,
-    secrets: Optional[dict] = None,
-    env: Optional[dict] = None,
-    manual: Optional[dict] = None,
-) -> Dict[str, str]:
-    """
-    Returns dict with keys: ZERADAS, QUEDA, BLOQUEIO, SNAPSHOT.
-    Priority: manual -> secrets -> env
-    Expected secret/env names:
-      DISCORD_WEBHOOK_ZERADAS
-      DISCORD_WEBHOOK_QUEDA
-      DISCORD_WEBHOOK_BLOQUEIO
-      DISCORD_WEBHOOK_SNAPSHOT
-    """
-    secrets = secrets or {}
-    env = env or os.environ
-    manual = manual or {}
-
-    def pick(key: str) -> str:
-        v = (manual.get(key) or "").strip()
-        if v:
-            return v
-        v = (secrets.get(key) if isinstance(secrets, dict) else None) or ""
-        v = str(v).strip()
-        if v:
-            return v
-        return str(env.get(key, "") or "").strip()
-
-    return {
-        "ZERADAS": pick("DISCORD_WEBHOOK_ZERADAS"),
-        "QUEDA": pick("DISCORD_WEBHOOK_QUEDA"),
-        "BLOQUEIO": pick("DISCORD_WEBHOOK_BLOQUEIO"),
-        "SNAPSHOT": pick("DISCORD_WEBHOOK_SNAPSHOT"),
-    }
 
 def send_discord_reports(
     alerts_df: pd.DataFrame,
@@ -828,10 +1105,6 @@ def send_discord_reports(
     top_n_each: int = 60,
     username: str = "Checklist Bot",
 ) -> Dict[str, object]:
-    """
-    Sends 3 category reports to their respective webhooks.
-    Returns stats dict.
-    """
     result = {
         "sent": {},
         "errors": {},
@@ -878,63 +1151,7 @@ def send_discord_reports(
 
 
 # =========================
-# Discord Webhook (Imagens / Dashboard) - NOVO
-# =========================
-def discord_send_multi_images(
-    webhook_url: str,
-    *,
-    description: str,
-    images: Sequence[tuple[str, bytes]],
-    chunk_size: int = 4,
-) -> tuple[bool, str]:
-    """
-    Envia imagens para Discord usando attachments + embeds.
-    - description: texto do primeiro embed do chunk (nos demais chunks fica vazio)
-    - images: lista de (filename, png_bytes)
-    - chunk_size: manter 4/5 ajuda com limites e rate.
-    """
-    webhook_url = (webhook_url or "").strip()
-    if not webhook_url:
-        return False, "Webhook não configurado."
-
-    if not images:
-        return False, "Sem imagens para enviar."
-
-    if requests is None:
-        return False, "Dependência ausente: requests (pip install requests)."
-
-    for i in range(0, len(images), int(chunk_size)):
-        chunk = list(images[i:i + int(chunk_size)])
-
-        embeds = []
-        for fname, _ in chunk:
-            embeds.append({
-                "title": fname.replace(".png", ""),
-                "description": description if i == 0 else "",
-                "image": {"url": f"attachment://{fname}"},
-                "type": "rich",
-            })
-
-        payload = {"embeds": embeds}
-
-        files = {
-            "payload_json": (None, json.dumps(payload, ensure_ascii=False), "application/json"),
-        }
-        for fname, bts in chunk:
-            files[fname] = (fname, bts, "image/png")
-
-        try:
-            r = requests.post(webhook_url, files=files, timeout=40)
-            if not (200 <= r.status_code < 300):
-                return False, f"Falhou (HTTP {r.status_code}): {r.text[:300]}"
-        except Exception as e:
-            return False, f"Erro ao enviar: {type(e).__name__}: {e}"
-
-    return True, f"Enviado em {((len(images) - 1) // int(chunk_size)) + 1} mensagem(ns)."
-
-
-# =========================
-# PNG charts (Matplotlib) - NOVO
+# PNG charts (Matplotlib) - já existia
 # =========================
 def _fmt_int_raw(n: int) -> str:
     try:
@@ -964,7 +1181,6 @@ def make_line_chart_png(
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
 
-    # ticks (evita poluir se for grande)
     if len(xs) <= 35:
         ax.set_xticks(xs)
 
@@ -1033,19 +1249,12 @@ def make_barh_chart_png(
 
 def build_daily_dashboard_images(
     *,
-    ts_daily: pd.DataFrame,          # cols: date_dt, total
-    top_emp_df: pd.DataFrame,        # cols: company_name, total
-    zero_down_df: pd.DataFrame,      # cols: date_dt, zero_accounts, down_accounts
+    ts_daily: pd.DataFrame,
+    top_emp_df: pd.DataFrame,
+    zero_down_df: pd.DataFrame,
     title_prefix: str,
     topn: int,
 ) -> list[tuple[str, bytes]]:
-    """
-    Gera 4 imagens em PNG:
-    1) Total por dia
-    2) Top empresas (barra horizontal)
-    3) Contas zeradas por dia (count)
-    4) Contas em queda por dia (count)
-    """
     images: list[tuple[str, bytes]] = []
 
     ts = ts_daily.copy()

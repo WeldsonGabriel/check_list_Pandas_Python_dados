@@ -5,7 +5,6 @@ import io
 import re
 import math
 import json
-from datetime import date
 from typing import Optional, List, Tuple, Dict
 
 import streamlit as st
@@ -14,20 +13,12 @@ import numpy as np
 
 # Plotly (mantém para o Ground). Gráficos de snapshot serão Matplotlib (bytes PNG).
 try:
-    import plotly.express as px
     import plotly.graph_objects as go
 except Exception:
-    px = None
     go = None
 
-# Matplotlib (snapshot + exibição idêntica Streamlit/Discord)
+# Matplotlib (snapshot + cards PNG)
 import matplotlib.pyplot as plt
-
-# Requests (snapshot webhook com attachments)
-try:
-    import requests
-except Exception:
-    requests = None
 
 from core import (
     Thresholds,
@@ -46,14 +37,16 @@ from services import (
     parse_baas_csv,
     build_checklist_weeks,
     enrich_baas,
-    build_daily_matrix,
     build_alerts,
     daily_totals_from_facts,
     top_companies_from_facts,
     zero_and_down_counts_by_day,
     resolve_webhooks_from_sources,
-    send_discord_reports,
-    send_discord_webhook,  # texto (urllib) já existente no services.py
+    send_discord_webhook,  # texto (urllib) já existente
+    # NOVOS (cards PNG + envio 1 por vez)
+    build_card_images_from_alerts,
+    send_card_images_to_discord,
+    discord_send_single_image,
 )
 
 
@@ -65,58 +58,6 @@ def _get_streamlit_secrets_safe() -> dict:
         return dict(st.secrets)
     except Exception:
         return {}
-
-
-# =========================
-# Discord: envio de múltiplas imagens (attachments) estilo "Transações por Hora"
-# =========================
-def discord_send_multi_images(
-    webhook_url: str,
-    description: str,
-    images: List[Tuple[str, bytes]],
-    *,
-    chunk_size: int = 5,
-) -> Tuple[bool, str]:
-    """
-    Envia embeds com imagens como attachments.
-    - 1 embed por imagem
-    - description aparece só no primeiro embed do primeiro chunk (pra não duplicar)
-    """
-    if not webhook_url:
-        return False, "Webhook não configurado."
-    if requests is None:
-        return False, "Dependência ausente: instale `requests` (pip install requests)."
-    if not images:
-        return False, "Nenhuma imagem para enviar."
-
-    for i in range(0, len(images), chunk_size):
-        chunk = images[i:i + chunk_size]
-
-        embeds = []
-        for fname, _ in chunk:
-            embeds.append({
-                "title": fname.replace(".png", ""),
-                "description": description if i == 0 and len(embeds) == 0 else "",
-                "image": {"url": f"attachment://{fname}"},
-                "type": "rich",
-            })
-
-        payload = {"embeds": embeds}
-
-        files = {
-            "payload_json": (None, json.dumps(payload, ensure_ascii=False), "application/json"),
-        }
-        for fname, bts in chunk:
-            files[fname] = (fname, bts, "image/png")
-
-        try:
-            r = requests.post(webhook_url, files=files, timeout=40)
-            if not (200 <= r.status_code < 300):
-                return False, f"Falhou (HTTP {r.status_code}): {r.text[:300]}"
-        except Exception as e:
-            return False, f"Erro ao enviar: {e}"
-
-    return True, f"Enviado em {((len(images) - 1) // chunk_size) + 1} mensagem(ns)."
 
 
 # =========================
@@ -480,7 +421,7 @@ with st.sidebar:
     wh_down = st.text_input("Webhook — Queda", value="", type="password", key="wh_down")
     wh_block = st.text_input("Webhook — Bloqueio", value="", type="password", key="wh_block")
 
-    st.caption("Snapshot (4 gráficos diários + resumo).")
+    st.caption("Snapshot (4 gráficos + cards NORMAL).")
     wh_snapshot = st.text_input("Webhook — Snapshot", value="", type="password", key="wh_snapshot")
 
     top_n_discord = st.selectbox("Top por categoria (Discord)", [20, 40, 60, 100, 150], index=2, key="top_n_discord")
@@ -570,6 +511,10 @@ with tab_main:
                 cfg=alert_cfg,
             )
 
+            # n_days (pra média diária dos cards PNG bater com o período do CSV)
+            day_cols_all = [c for c in daily_table.columns if isinstance(c, pd.Timestamp)]
+            n_days = int(len(day_cols_all))
+
             st.session_state["facts"] = facts
             st.session_state["companies_keys"] = companies_keys
             st.session_state["day_ref"] = day_ref
@@ -583,15 +528,7 @@ with tab_main:
             st.session_state["daily_end"] = end_day
             st.session_state["daily_table"] = daily_table
             st.session_state["alerts_df"] = alerts_df
-
-            # snapshot cache (pra não recalcular na hora do envio)
-            ts = daily_totals_from_facts(facts, companies_keys, company_name_filter="TOTAL GERAL")
-            top_df = top_companies_from_facts(facts, companies_keys, topn=int(st.session_state.get("snap_topn_emp", 15)))
-            zero_down = zero_and_down_counts_by_day(daily_table, alert_cfg)
-
-            st.session_state["snap_ts"] = ts
-            st.session_state["snap_top"] = top_df
-            st.session_state["snap_zero_down"] = zero_down
+            st.session_state["n_days"] = n_days
 
     if "df_final" not in st.session_state:
         st.info("Preencha empresas + suba CSV + clique em **Processar**.")
@@ -618,7 +555,7 @@ with tab_main:
         st.metric("Soma bloqueada (R$)", fmt_money_pt(kpi_blocked_sum))
 
     st.divider()
-    st.subheader("Envio para Discord (manual)")
+    st.subheader("Envio para Discord (manual) — Cards PNG (1 por mensagem) + Snapshot")
 
     manual_hooks = {
         "DISCORD_WEBHOOK_ZERADAS": st.session_state.get("wh_zero", ""),
@@ -633,86 +570,181 @@ with tab_main:
         manual=manual_hooks,
     )
 
-    # compat: se services.py ainda não tiver SNAPSHOT no resolver, tenta pegar manual/secrets/env direto
-    snapshot_hook = (hooks.get("SNAPSHOT") or hooks.get("DISCORD_WEBHOOK_SNAPSHOT") or "").strip()
-    if not snapshot_hook:
-        snapshot_hook = str(_get_streamlit_secrets_safe().get("DISCORD_WEBHOOK_SNAPSHOT", "") or "").strip()
+    snapshot_hook = (hooks.get("SNAPSHOT") or "").strip()
+    zeradas_hook = (hooks.get("ZERADAS") or "").strip()
+    queda_hook = (hooks.get("QUEDA") or "").strip()
+    bloqueio_hook = (hooks.get("BLOQUEIO") or "").strip()
 
-    colA, colB, colC = st.columns([1.0, 1.0, 1.0], gap="small")
-    with colA:
-        send_btn = st.button("Enviar Alertas (3 canais)", use_container_width=True)
-    with colB:
-        send_snap_btn = st.button("Enviar Snapshot (4 gráficos)", use_container_width=True)
-    with colC:
-        st.caption("Snapshot = mesmos gráficos do app (Matplotlib) + resumo.")
+    b1, b2, b3, b4 = st.columns(4, gap="small")
+    with b1:
+        send_zero_btn = st.button("Enviar Zeradas (cards)", use_container_width=True)
+    with b2:
+        send_down_btn = st.button("Enviar Queda (cards)", use_container_width=True)
+    with b3:
+        send_block_btn = st.button("Enviar Bloqueio (cards)", use_container_width=True)
+    with b4:
+        send_snapshot_btn = st.button("Enviar Snapshot (gráficos + NORMAL)", use_container_width=True)
 
-    if send_btn:
-        if "alerts_df" not in st.session_state:
-            st.error("Você precisa processar primeiro para gerar alerts_df.")
+    # =========
+    # Envios (cards)
+    # =========
+    if send_zero_btn or send_down_btn or send_block_btn:
+        if "alerts_df" not in st.session_state or "daily_table" not in st.session_state:
+            st.error("Você precisa processar primeiro (alerts_df/daily_table não encontrados).")
         else:
             alerts_df = st.session_state.get("alerts_df", pd.DataFrame())
             period = str(alerts_df["Periodo"].iloc[0]) if (alerts_df is not None and not alerts_df.empty and "Periodo" in alerts_df.columns) else "—"
+            n_days = int(st.session_state.get("n_days", 0))
 
-            with st.spinner("Enviando para o Discord..."):
-                report = send_discord_reports(
-                    alerts_df=alerts_df,
-                    cfg=alert_cfg,
-                    webhooks={
-                        "ZERADAS": hooks.get("ZERADAS", ""),
-                        "QUEDA": hooks.get("QUEDA", ""),
-                        "BLOQUEIO": hooks.get("BLOQUEIO", ""),
-                    },
-                    period=period,
-                    top_n_each=int(st.session_state.get("top_n_discord", 60)),
-                    username="Checklist Bot",
-                )
+            top_n_each = int(st.session_state.get("top_n_discord", 60))
 
-            st.success("Envio finalizado. Veja o status abaixo:")
-            st.json(report)
+            if send_zero_btn:
+                if not zeradas_hook:
+                    st.error("Webhook Zeradas não configurado.")
+                else:
+                    desc = (
+                        f"**ALERTAS — ZERADAS (CARDS PNG)**\n"
+                        f"**Período (diário):** {period}\n"
+                        f"**Regra:** Streak_zero ≥ {int(alert_cfg.zero_yellow)} dia(s)\n"
+                        f"**Envio:** 1 card por mensagem (sempre com cabeçalho)\n"
+                    )
+                    with st.spinner("Gerando cards e enviando (ZERADAS)..."):
+                        imgs = build_card_images_from_alerts(
+                            alerts_df=alerts_df,
+                            category="ZERADAS",
+                            cfg=alert_cfg,
+                            n_days=n_days,
+                            top_n=top_n_each,
+                        )
+                        report = send_card_images_to_discord(
+                            zeradas_hook,
+                            description=desc,
+                            images=imgs,
+                            username="Checklist Bot",
+                        )
+                    st.success(f"ZERADAS: enviados {report.get('sent',0)} card(s).") if not report.get("errors") else st.error(report.get("errors"))
 
-    if send_snap_btn:
+            if send_down_btn:
+                if not queda_hook:
+                    st.error("Webhook Queda não configurado.")
+                else:
+                    desc = (
+                        f"**ALERTAS — QUEDA (CARDS PNG)**\n"
+                        f"**Período (diário):** {period}\n"
+                        f"**Regra:** Streak_down ≥ {int(alert_cfg.down_yellow)} dia(s) | baseline {int(alert_cfg.baseline_days)}d | limiar {int(alert_cfg.drop_ratio*100)}%\n"
+                        f"**Envio:** 1 card por mensagem (sempre com cabeçalho)\n"
+                    )
+                    with st.spinner("Gerando cards e enviando (QUEDA)..."):
+                        imgs = build_card_images_from_alerts(
+                            alerts_df=alerts_df,
+                            category="QUEDA",
+                            cfg=alert_cfg,
+                            n_days=n_days,
+                            top_n=top_n_each,
+                        )
+                        report = send_card_images_to_discord(
+                            queda_hook,
+                            description=desc,
+                            images=imgs,
+                            username="Checklist Bot",
+                        )
+                    st.success(f"QUEDA: enviados {report.get('sent',0)} card(s).") if not report.get("errors") else st.error(report.get("errors"))
+
+            if send_block_btn:
+                if not bloqueio_hook:
+                    st.error("Webhook Bloqueio não configurado.")
+                else:
+                    desc = (
+                        f"**ALERTAS — BLOQUEIO (CARDS PNG)**\n"
+                        f"**Período (diário):** {period}\n"
+                        f"**Regra:** Bloqueio ≥ R$ {fmt_money_pt(float(alert_cfg.block_yellow))}\n"
+                        f"**Envio:** 1 card por mensagem (sempre com cabeçalho)\n"
+                    )
+                    with st.spinner("Gerando cards e enviando (BLOQUEIO)..."):
+                        imgs = build_card_images_from_alerts(
+                            alerts_df=alerts_df,
+                            category="BLOQUEIO",
+                            cfg=alert_cfg,
+                            n_days=n_days,
+                            top_n=top_n_each,
+                        )
+                        report = send_card_images_to_discord(
+                            bloqueio_hook,
+                            description=desc,
+                            images=imgs,
+                            username="Checklist Bot",
+                        )
+                    st.success(f"BLOQUEIO: enviados {report.get('sent',0)} card(s).") if not report.get("errors") else st.error(report.get("errors"))
+
+    # =========
+    # Snapshot (gráficos + cards NORMAL no mesmo webhook)
+    # =========
+    if send_snapshot_btn:
         if not snapshot_hook:
-            st.error("Webhook SNAPSHOT não configurado (manual ou DISCORD_WEBHOOK_SNAPSHOT em secrets/env).")
-        elif "facts" not in st.session_state or "daily_table" not in st.session_state:
+            st.error("Webhook Snapshot não configurado.")
+        elif "facts" not in st.session_state or "daily_table" not in st.session_state or "alerts_df" not in st.session_state:
             st.error("Você precisa processar primeiro (dados não encontrados).")
         else:
-            # dados
             facts = st.session_state.get("facts", pd.DataFrame())
             companies_keys = st.session_state.get("companies_keys", [])
             daily_table_all = st.session_state.get("daily_table", pd.DataFrame())
+            alerts_df = st.session_state.get("alerts_df", pd.DataFrame())
+            n_days = int(st.session_state.get("n_days", 0))
 
-            # recalcula com config atual (para refletir baseline/ratio do sidebar)
+            period = str(alerts_df["Periodo"].iloc[0]) if (alerts_df is not None and not alerts_df.empty and "Periodo" in alerts_df.columns) else "—"
+
+            # recalcula (para refletir baseline/ratio do sidebar)
             ts = daily_totals_from_facts(facts, companies_keys, company_name_filter="TOTAL GERAL")
             top_df = top_companies_from_facts(facts, companies_keys, topn=int(st.session_state.get("snap_topn_emp", 15)))
             zero_down = zero_and_down_counts_by_day(daily_table_all, alert_cfg)
 
-            # KPIs resumo
-            alerts_df = st.session_state.get("alerts_df", pd.DataFrame())
-            period = str(alerts_df["Periodo"].iloc[0]) if (alerts_df is not None and not alerts_df.empty and "Periodo" in alerts_df.columns) else "—"
-
+            # KPIs
             total_scope = int(ts["total"].sum()) if not ts.empty else 0
             avg_day = int(round(float(ts["total"].mean()))) if not ts.empty else 0
             peak_day = int(ts["total"].max()) if not ts.empty else 0
-            last_day = str(pd.to_datetime(ts["date_dt"].max()).date().isoformat()) if not ts.empty else "—"
+
+            last_day_dt = pd.to_datetime(ts["date_dt"].max()).date() if not ts.empty else None
+            last_day = str(last_day_dt.isoformat()) if last_day_dt else "—"
+            last_day_tx = int(ts.loc[ts["date_dt"] == pd.to_datetime(last_day_dt), "total"].iloc[0]) if (last_day_dt and not ts.empty) else 0
+
+            # NOVO: média dos dias anteriores + % do último dia vs média anterior
+            mean_prev = 0
+            pct_last_vs_prev = 0.0
+            if ts is not None and not ts.empty and len(ts) >= 2:
+                ts_sorted = ts.sort_values("date_dt").reset_index(drop=True)
+                prev = ts_sorted.iloc[:-1]
+                mean_prev = int(round(float(prev["total"].mean()))) if not prev.empty else 0
+                if mean_prev > 0:
+                    pct_last_vs_prev = ((float(last_day_tx) - float(mean_prev)) / float(mean_prev)) * 100.0
 
             # contagens semanal (df_final)
             counts_week = {s: int((df_final["status"] == s).sum()) for s in STATUS_ORDER} if not df_final.empty else {s: 0 for s in STATUS_ORDER}
 
+            # descrição (ajustes pedidos)
             desc = (
                 f"**CHECKLIST SNAPSHOT**\n"
                 f"**Período (diário):** {period}\n"
-                f"**Último dia do CSV:** {last_day}\n\n"
-                f"**Total no período (escopo):** {fmt_int_pt(total_scope)}\n"
-                f"**Média/dia:** {fmt_int_pt(avg_day)} | **Pico diário:** {fmt_int_pt(peak_day)}\n\n"
+                f"**Último dia do CSV:** {last_day}\n"
+                f"**Último dia (transações):** {fmt_int_pt(last_day_tx)}\n\n"
+                f"**Total no período (transações no escopo):** {fmt_int_pt(total_scope)}\n"
+                f"**Média/dia:** {fmt_int_pt(avg_day)} | **Pico diário:** {fmt_int_pt(peak_day)}\n"
+                f"**Média (dias anteriores):** {fmt_int_pt(mean_prev)} | **Último dia vs média anterior:** {pct_last_vs_prev:+.0f}%\n\n"
                 f"**Status semanal (contas):** "
                 f"🔴 {counts_week['Alerta (queda/ zerada)']} | "
                 f"🟡 {counts_week['Investigar']} | "
                 f"🔵 {counts_week['Gerenciar (aumento)']} | "
                 f"🟢 {counts_week['Normal']}\n"
-                f"**Bloqueios:** {fmt_int_pt(int(kpi_blocked_accounts))} conta(s) | **R$ {fmt_money_pt(float(kpi_blocked_sum))}**"
+                f"**Bloqueios:** {fmt_int_pt(int(kpi_blocked_accounts))} conta(s) | **R$ {fmt_money_pt(float(kpi_blocked_sum))}**\n"
+                f"**NORMAL:** cards PNG enviados neste canal (1 por mensagem)."
             )
 
-            with st.spinner("Gerando gráficos e enviando..."):
+            with st.spinner("Gerando e enviando Snapshot (1 por vez)..."):
+                # 1) envia o texto (log)
+                ok_txt, msg_txt = send_discord_webhook(snapshot_hook, desc, username="Checklist Bot")
+                if not ok_txt:
+                    st.warning(f"Falha ao enviar texto do snapshot: {msg_txt}")
+
+                # 2) gera PNGs dos 4 gráficos
                 img1 = chart_daily_total(ts, "1) Total de transações por dia (escopo)")
                 img2 = chart_top_companies(top_df, f"2) Top empresas por volume (Top {len(top_df)})")
                 img3 = chart_counts(zero_down, "zero_accounts", "3) Contas zeradas por dia (count)")
@@ -722,27 +754,45 @@ with tab_main:
                     f"4) Contas em queda por dia (baseline {alert_cfg.baseline_days}d / limiar {int(alert_cfg.drop_ratio*100)}%)",
                 )
 
-                images = [
+                # 3) envia 1 gráfico por mensagem (sempre com cabeçalho)
+                charts = [
                     ("01 - Total por dia.png", img1),
                     ("02 - Top empresas.png", img2),
                     ("03 - Zeradas por dia.png", img3),
                     ("04 - Queda por dia.png", img4),
                 ]
+                for fname, bts in charts:
+                    ok, msg = discord_send_single_image(
+                        snapshot_hook,
+                        description=desc,
+                        filename=fname,
+                        png_bytes=bts,
+                        title=fname.replace(".png", ""),
+                        username="Checklist Bot",
+                    )
+                    if not ok:
+                        st.error(f"Falha ao enviar gráfico {fname}: {msg}")
+                        st.stop()
 
-                # 1) manda texto (opcional, para ficar logado mesmo se embed falhar)
-                ok_txt, msg_txt = send_discord_webhook(snapshot_hook, desc, username="Checklist Bot")
-                if not ok_txt:
-                    st.warning(f"Falha ao enviar texto do snapshot: {msg_txt}")
-
-                # 2) manda imagens (embeds)
-                ok, msg = discord_send_multi_images(
-                    webhook_url=snapshot_hook,
+                # 4) NORMAL -> cards PNG no snapshot
+                normal_imgs = build_card_images_from_alerts(
+                    alerts_df=alerts_df,
+                    category="NORMAL",
+                    cfg=alert_cfg,
+                    n_days=n_days,
+                    top_n=int(st.session_state.get("top_n_discord", 60)),
+                )
+                normal_report = send_card_images_to_discord(
+                    snapshot_hook,
                     description=desc,
-                    images=images,
-                    chunk_size=4,
+                    images=normal_imgs,
+                    username="Checklist Bot",
                 )
 
-            st.success(msg) if ok else st.error(msg)
+            if normal_report.get("errors"):
+                st.warning(f"Snapshot OK (gráficos), mas NORMAL teve erro: {normal_report.get('errors')}")
+            else:
+                st.success(f"Snapshot enviado + NORMAL: {normal_report.get('sent',0)} card(s).")
 
     st.divider()
     st.subheader("Visão Geral (semanal)")
@@ -865,7 +915,8 @@ with tab_main:
     st.dataframe(show.iloc[start:end].copy(), use_container_width=True, hide_index=True)
 
     st.divider()
-    st.subheader("Cards (para colar no Discord) — semanal")
+    st.subheader("Cards (texto, opcional) — semanal")
+    st.caption("Somente para visualização no app (o envio para Discord agora é via cards PNG).")
 
     alerts_week = df_final[df_final["status"] != "Normal"].copy()
     if alerts_week.empty:
@@ -977,7 +1028,6 @@ with tab_alerts:
                     Total: {fmt_int_pt(int(r['Total_Periodo']))}<br>
                     Último dia: {fmt_int_pt(int(r['Ultimo_Dia']))}<br>
                     Frequência: {float(r['Freq_pct']):.0f}%<br>
-                    Média diária: {int(r['Total_Periodo']/max(1,len(day_cols)))}<br>
                     Saldo: R$ {fmt_money_pt(float(r['Saldo']))}<br>
                     Bloqueio: R$ {fmt_money_pt(float(r['Saldo_Bloqueado']))}<br>
 
@@ -1112,7 +1162,7 @@ with tab_graphs:
         st.stop()
 
     st.subheader("Gráficos (Diário)")
-    st.caption("Snapshot = exatamente estes 4 gráficos (PNG).")
+    st.caption("Snapshot = exatamente estes 4 gráficos (PNG) + cards NORMAL (PNG).")
 
     topn_emp = int(st.session_state.get("snap_topn_emp", 15))
 
