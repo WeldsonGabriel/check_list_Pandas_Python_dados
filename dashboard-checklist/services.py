@@ -793,6 +793,9 @@ def resolve_webhooks_from_sources(
     Returns dict with keys: ZERADAS, QUEDA, BLOQUEIO, SNAPSHOT.
     Priority: manual -> secrets -> env
     Expected secret/env names:
+      DISCORD_WEBHOOK_ZERADAS
+      DISCORD_WEBHOOK_QUEDA
+      DISCORD_WEBHOOK_BLOQUEIO
       DISCORD_WEBHOOK_SNAPSHOT
     """
     secrets = secrets or {}
@@ -810,6 +813,9 @@ def resolve_webhooks_from_sources(
         return str(env.get(key, "") or "").strip()
 
     return {
+        "ZERADAS": pick("DISCORD_WEBHOOK_ZERADAS"),
+        "QUEDA": pick("DISCORD_WEBHOOK_QUEDA"),
+        "BLOQUEIO": pick("DISCORD_WEBHOOK_BLOQUEIO"),
         "SNAPSHOT": pick("DISCORD_WEBHOOK_SNAPSHOT"),
     }
 
