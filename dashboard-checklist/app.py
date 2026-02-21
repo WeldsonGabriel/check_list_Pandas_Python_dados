@@ -37,13 +37,13 @@ from services import (
     parse_baas_csv,
     build_checklist_weeks,
     enrich_baas,
+    build_daily_matrix,  # <-- ADICIONAR
     build_alerts,
     daily_totals_from_facts,
     top_companies_from_facts,
     zero_and_down_counts_by_day,
     resolve_webhooks_from_sources,
-    send_discord_webhook,  # texto (urllib) já existente
-    # NOVOS (cards PNG + envio 1 por vez)
+    send_discord_webhook,
     build_card_images_from_alerts,
     send_card_images_to_discord,
     discord_send_single_image,
