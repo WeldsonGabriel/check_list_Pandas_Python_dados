@@ -1,12 +1,18 @@
 # app.py
 from __future__ import annotations
 
+import io
 import re
 import math
+import json
+from datetime import date
+from typing import Optional, List, Tuple, Dict
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 
+# Plotly (mantém para o Ground). Gráficos de snapshot serão Matplotlib (bytes PNG).
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -14,13 +20,20 @@ except Exception:
     px = None
     go = None
 
+# Matplotlib (snapshot + exibição idêntica Streamlit/Discord)
+import matplotlib.pyplot as plt
+
+# Requests (snapshot webhook com attachments)
+try:
+    import requests
+except Exception:
+    requests = None
+
 from core import (
     Thresholds,
     AlertConfig,
     STATUS_ORDER,
     STATUS_DOT,
-    LOCK_ICON,
-    UNLOCK_ICON,
     fmt_int_pt,
     fmt_money_pt,
     clamp_int,
@@ -40,17 +53,14 @@ from services import (
     zero_and_down_counts_by_day,
     resolve_webhooks_from_sources,
     send_discord_reports,
+    send_discord_webhook,  # texto (urllib) já existente no services.py
 )
 
+
 # =========================
-# Secrets safe loader (BUGFIX)
+# Secrets safe loader
 # =========================
 def _get_streamlit_secrets_safe() -> dict:
-    """
-    st.secrets pode levantar StreamlitSecretNotFoundError se não existir secrets.toml
-    (local) ou se não tiver secrets configurado no Streamlit Cloud.
-    Aqui a gente garante que isso nunca derruba o app.
-    """
     try:
         return dict(st.secrets)
     except Exception:
@@ -58,14 +68,62 @@ def _get_streamlit_secrets_safe() -> dict:
 
 
 # =========================
-# Page config
+# Discord: envio de múltiplas imagens (attachments) estilo "Transações por Hora"
 # =========================
-st.set_page_config(page_title="Checklist Semanas + BaaS", layout="wide")
+def discord_send_multi_images(
+    webhook_url: str,
+    description: str,
+    images: List[Tuple[str, bytes]],
+    *,
+    chunk_size: int = 5,
+) -> Tuple[bool, str]:
+    """
+    Envia embeds com imagens como attachments.
+    - 1 embed por imagem
+    - description aparece só no primeiro embed do primeiro chunk (pra não duplicar)
+    """
+    if not webhook_url:
+        return False, "Webhook não configurado."
+    if requests is None:
+        return False, "Dependência ausente: instale `requests` (pip install requests)."
+    if not images:
+        return False, "Nenhuma imagem para enviar."
+
+    for i in range(0, len(images), chunk_size):
+        chunk = images[i:i + chunk_size]
+
+        embeds = []
+        for fname, _ in chunk:
+            embeds.append({
+                "title": fname.replace(".png", ""),
+                "description": description if i == 0 and len(embeds) == 0 else "",
+                "image": {"url": f"attachment://{fname}"},
+                "type": "rich",
+            })
+
+        payload = {"embeds": embeds}
+
+        files = {
+            "payload_json": (None, json.dumps(payload, ensure_ascii=False), "application/json"),
+        }
+        for fname, bts in chunk:
+            files[fname] = (fname, bts, "image/png")
+
+        try:
+            r = requests.post(webhook_url, files=files, timeout=40)
+            if not (200 <= r.status_code < 300):
+                return False, f"Falhou (HTTP {r.status_code}): {r.text[:300]}"
+        except Exception as e:
+            return False, f"Erro ao enviar: {e}"
+
+    return True, f"Enviado em {((len(images) - 1) // chunk_size) + 1} mensagem(ns)."
 
 
 # =========================
 # CSS
 # =========================
+st.set_page_config(page_title="Checklist Semanas + BaaS", layout="wide")
+
 st.markdown(
     """
 <style>
@@ -267,6 +325,105 @@ def render_ground_panel(
 
 
 # =========================
+# Snapshot charts (Matplotlib) -> bytes PNG
+# =========================
+def _fig_to_png_bytes(fig) -> bytes:
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def chart_daily_total(ts: pd.DataFrame, title: str) -> bytes:
+    fig = plt.figure(figsize=(10, 3.5))
+    ax = fig.add_subplot(111)
+    if ts is None or ts.empty:
+        ax.set_title("Sem dados")
+        ax.set_xlabel("Dia")
+        ax.set_ylabel("Transações")
+        fig.tight_layout()
+        return _fig_to_png_bytes(fig)
+
+    x = pd.to_datetime(ts["date_dt"]).dt.date.astype(str).tolist()
+    y = ts["total"].astype(int).tolist()
+
+    ax.plot(range(len(x)), y, marker="o")
+    ax.set_title(title)
+    ax.set_xlabel("Dia")
+    ax.set_ylabel("Transações")
+    ax.set_xticks(range(len(x)))
+    ax.set_xticklabels([d[-2:] for d in x], rotation=0)
+
+    max_y = max(y) if y else 0
+    for i, v in enumerate(y):
+        ax.annotate(str(int(v)), (i, v), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=9, fontweight="bold")
+
+    ax.set_ylim(bottom=0, top=max_y * 1.15 + 1)
+    fig.tight_layout()
+    return _fig_to_png_bytes(fig)
+
+
+def chart_top_companies(top_df: pd.DataFrame, title: str) -> bytes:
+    fig = plt.figure(figsize=(10, 4.2))
+    ax = fig.add_subplot(111)
+    if top_df is None or top_df.empty:
+        ax.set_title("Sem dados")
+        ax.set_xlabel("Total")
+        ax.set_ylabel("Empresa")
+        fig.tight_layout()
+        return _fig_to_png_bytes(fig)
+
+    d = top_df.copy()
+    d["total"] = d["total"].astype(int)
+    d = d.sort_values("total", ascending=True)
+    ylabels = d["company_name"].astype(str).tolist()
+    vals = d["total"].tolist()
+
+    ax.barh(range(len(vals)), vals)
+    ax.set_yticks(range(len(vals)))
+    ax.set_yticklabels(ylabels)
+    ax.set_title(title)
+    ax.set_xlabel("Total no período")
+
+    max_v = max(vals) if vals else 0
+    for i, v in enumerate(vals):
+        ax.text(v + max(1, int(max_v * 0.01)), i, str(int(v)), va="center", fontsize=9, fontweight="bold")
+
+    fig.tight_layout()
+    return _fig_to_png_bytes(fig)
+
+
+def chart_counts(zero_down: pd.DataFrame, col: str, title: str) -> bytes:
+    fig = plt.figure(figsize=(10, 3.2))
+    ax = fig.add_subplot(111)
+
+    if zero_down is None or zero_down.empty or col not in zero_down.columns:
+        ax.set_title("Sem dados")
+        ax.set_xlabel("Dia")
+        ax.set_ylabel("Contas")
+        fig.tight_layout()
+        return _fig_to_png_bytes(fig)
+
+    x = pd.to_datetime(zero_down["date_dt"]).dt.date.astype(str).tolist()
+    y = zero_down[col].astype(int).tolist()
+
+    ax.plot(range(len(x)), y, marker="o")
+    ax.set_title(title)
+    ax.set_xlabel("Dia")
+    ax.set_ylabel("Contas")
+    ax.set_xticks(range(len(x)))
+    ax.set_xticklabels([d[-2:] for d in x], rotation=0)
+
+    max_y = max(y) if y else 0
+    for i, v in enumerate(y):
+        ax.annotate(str(int(v)), (i, v), textcoords="offset points", xytext=(0, 6), ha="center", fontsize=9, fontweight="bold")
+
+    ax.set_ylim(bottom=0, top=max_y * 1.15 + 1)
+    fig.tight_layout()
+    return _fig_to_png_bytes(fig)
+
+
+# =========================
 # App
 # =========================
 st.title("Checklist (Semanas 1–4) + Saldos/Bloqueio (BaaS)")
@@ -291,7 +448,6 @@ with st.sidebar:
 
     st.divider()
     st.header("Alertas (farol / diário)")
-
     st.caption("Streak zerado (dias)")
     zero_y = st.number_input("Zerado ≥ (amarelo)", value=5, min_value=1, step=1)
     zero_o = st.number_input("Zerado ≥ (laranja)", value=10, min_value=2, step=1)
@@ -319,12 +475,19 @@ with st.sidebar:
     st.divider()
     st.header("Discord (Webhooks)")
 
-    st.caption("Opcional: se não usar st.secrets/env, cole aqui. (não envia sozinho, só no botão)")
+    st.caption("Manual (opcional). Se vazio, tenta st.secrets/env.")
     wh_zero = st.text_input("Webhook — Zeradas", value="", type="password", key="wh_zero")
     wh_down = st.text_input("Webhook — Queda", value="", type="password", key="wh_down")
     wh_block = st.text_input("Webhook — Bloqueio", value="", type="password", key="wh_block")
 
+    st.caption("Snapshot (4 gráficos diários + resumo).")
+    wh_snapshot = st.text_input("Webhook — Snapshot", value="", type="password", key="wh_snapshot")
+
     top_n_discord = st.selectbox("Top por categoria (Discord)", [20, 40, 60, 100, 150], index=2, key="top_n_discord")
+
+    st.divider()
+    st.header("Snapshot (config)")
+    snap_topn_emp = st.selectbox("Top empresas (snapshot)", [8, 10, 15, 20, 30], index=2, key="snap_topn_emp")
 
 
 thresholds = Thresholds(
@@ -351,7 +514,6 @@ alert_cfg = AlertConfig(
 )
 
 tab_main, tab_alerts, tab_daily, tab_graphs = st.tabs(["Principal", "Alertas", "Análise (Diário)", "Gráficos (Diário)"])
-
 
 
 # =========================
@@ -422,6 +584,15 @@ with tab_main:
             st.session_state["daily_table"] = daily_table
             st.session_state["alerts_df"] = alerts_df
 
+            # snapshot cache (pra não recalcular na hora do envio)
+            ts = daily_totals_from_facts(facts, companies_keys, company_name_filter="TOTAL GERAL")
+            top_df = top_companies_from_facts(facts, companies_keys, topn=int(st.session_state.get("snap_topn_emp", 15)))
+            zero_down = zero_and_down_counts_by_day(daily_table, alert_cfg)
+
+            st.session_state["snap_ts"] = ts
+            st.session_state["snap_top"] = top_df
+            st.session_state["snap_zero_down"] = zero_down
+
     if "df_final" not in st.session_state:
         st.info("Preencha empresas + suba CSV + clique em **Processar**.")
         st.stop()
@@ -453,19 +624,27 @@ with tab_main:
         "DISCORD_WEBHOOK_ZERADAS": st.session_state.get("wh_zero", ""),
         "DISCORD_WEBHOOK_QUEDA": st.session_state.get("wh_down", ""),
         "DISCORD_WEBHOOK_BLOQUEIO": st.session_state.get("wh_block", ""),
+        "DISCORD_WEBHOOK_SNAPSHOT": st.session_state.get("wh_snapshot", ""),
     }
 
     hooks = resolve_webhooks_from_sources(
-        secrets=_get_streamlit_secrets_safe(),  # ✅ BUGFIX aqui
+        secrets=_get_streamlit_secrets_safe(),
         env=None,
         manual=manual_hooks,
     )
 
-    colA, colB = st.columns([1.0, 1.0], gap="small")
+    # compat: se services.py ainda não tiver SNAPSHOT no resolver, tenta pegar manual/secrets/env direto
+    snapshot_hook = (hooks.get("SNAPSHOT") or hooks.get("DISCORD_WEBHOOK_SNAPSHOT") or "").strip()
+    if not snapshot_hook:
+        snapshot_hook = str(_get_streamlit_secrets_safe().get("DISCORD_WEBHOOK_SNAPSHOT", "") or "").strip()
+
+    colA, colB, colC = st.columns([1.0, 1.0, 1.0], gap="small")
     with colA:
-        send_btn = st.button("Enviar para Discord", use_container_width=True)
+        send_btn = st.button("Enviar Alertas (3 canais)", use_container_width=True)
     with colB:
-        st.caption("Usa os alertas da aba **Alertas** (alerts_df) e envia em 3 canais via webhook.")
+        send_snap_btn = st.button("Enviar Snapshot (4 gráficos)", use_container_width=True)
+    with colC:
+        st.caption("Snapshot = mesmos gráficos do app (Matplotlib) + resumo.")
 
     if send_btn:
         if "alerts_df" not in st.session_state:
@@ -491,12 +670,86 @@ with tab_main:
             st.success("Envio finalizado. Veja o status abaixo:")
             st.json(report)
 
+    if send_snap_btn:
+        if not snapshot_hook:
+            st.error("Webhook SNAPSHOT não configurado (manual ou DISCORD_WEBHOOK_SNAPSHOT em secrets/env).")
+        elif "facts" not in st.session_state or "daily_table" not in st.session_state:
+            st.error("Você precisa processar primeiro (dados não encontrados).")
+        else:
+            # dados
+            facts = st.session_state.get("facts", pd.DataFrame())
+            companies_keys = st.session_state.get("companies_keys", [])
+            daily_table_all = st.session_state.get("daily_table", pd.DataFrame())
+
+            # recalcula com config atual (para refletir baseline/ratio do sidebar)
+            ts = daily_totals_from_facts(facts, companies_keys, company_name_filter="TOTAL GERAL")
+            top_df = top_companies_from_facts(facts, companies_keys, topn=int(st.session_state.get("snap_topn_emp", 15)))
+            zero_down = zero_and_down_counts_by_day(daily_table_all, alert_cfg)
+
+            # KPIs resumo
+            alerts_df = st.session_state.get("alerts_df", pd.DataFrame())
+            period = str(alerts_df["Periodo"].iloc[0]) if (alerts_df is not None and not alerts_df.empty and "Periodo" in alerts_df.columns) else "—"
+
+            total_scope = int(ts["total"].sum()) if not ts.empty else 0
+            avg_day = int(round(float(ts["total"].mean()))) if not ts.empty else 0
+            peak_day = int(ts["total"].max()) if not ts.empty else 0
+            last_day = str(pd.to_datetime(ts["date_dt"].max()).date().isoformat()) if not ts.empty else "—"
+
+            # contagens semanal (df_final)
+            counts_week = {s: int((df_final["status"] == s).sum()) for s in STATUS_ORDER} if not df_final.empty else {s: 0 for s in STATUS_ORDER}
+
+            desc = (
+                f"**CHECKLIST SNAPSHOT**\n"
+                f"**Período (diário):** {period}\n"
+                f"**Último dia do CSV:** {last_day}\n\n"
+                f"**Total no período (escopo):** {fmt_int_pt(total_scope)}\n"
+                f"**Média/dia:** {fmt_int_pt(avg_day)} | **Pico diário:** {fmt_int_pt(peak_day)}\n\n"
+                f"**Status semanal (contas):** "
+                f"🔴 {counts_week['Alerta (queda/ zerada)']} | "
+                f"🟡 {counts_week['Investigar']} | "
+                f"🔵 {counts_week['Gerenciar (aumento)']} | "
+                f"🟢 {counts_week['Normal']}\n"
+                f"**Bloqueios:** {fmt_int_pt(int(kpi_blocked_accounts))} conta(s) | **R$ {fmt_money_pt(float(kpi_blocked_sum))}**"
+            )
+
+            with st.spinner("Gerando gráficos e enviando..."):
+                img1 = chart_daily_total(ts, "1) Total de transações por dia (escopo)")
+                img2 = chart_top_companies(top_df, f"2) Top empresas por volume (Top {len(top_df)})")
+                img3 = chart_counts(zero_down, "zero_accounts", "3) Contas zeradas por dia (count)")
+                img4 = chart_counts(
+                    zero_down,
+                    "down_accounts",
+                    f"4) Contas em queda por dia (baseline {alert_cfg.baseline_days}d / limiar {int(alert_cfg.drop_ratio*100)}%)",
+                )
+
+                images = [
+                    ("01 - Total por dia.png", img1),
+                    ("02 - Top empresas.png", img2),
+                    ("03 - Zeradas por dia.png", img3),
+                    ("04 - Queda por dia.png", img4),
+                ]
+
+                # 1) manda texto (opcional, para ficar logado mesmo se embed falhar)
+                ok_txt, msg_txt = send_discord_webhook(snapshot_hook, desc, username="Checklist Bot")
+                if not ok_txt:
+                    st.warning(f"Falha ao enviar texto do snapshot: {msg_txt}")
+
+                # 2) manda imagens (embeds)
+                ok, msg = discord_send_multi_images(
+                    webhook_url=snapshot_hook,
+                    description=desc,
+                    images=images,
+                    chunk_size=4,
+                )
+
+            st.success(msg) if ok else st.error(msg)
+
     st.divider()
     st.subheader("Visão Geral (semanal)")
     render_status_boxes(df_final)
     st.divider()
 
-    if px is None or go is None:
+    if go is None:
         st.warning("Instale plotly para ver o Ground.")
     elif df_final.empty:
         st.info("Sem dados.")
@@ -843,15 +1096,11 @@ with tab_daily:
 
 
 # =========================
-# GRÁFICOS (DIÁRIO)
+# GRÁFICOS (DIÁRIO) — Matplotlib (idêntico Streamlit/Discord)
 # =========================
 with tab_graphs:
     if "facts" not in st.session_state or "daily_table" not in st.session_state:
         st.info("Você precisa processar na aba Principal primeiro.")
-        st.stop()
-
-    if px is None:
-        st.warning("Instale plotly para ver os gráficos (plotly.express).")
         st.stop()
 
     facts = st.session_state.get("facts", pd.DataFrame())
@@ -863,27 +1112,17 @@ with tab_graphs:
         st.stop()
 
     st.subheader("Gráficos (Diário)")
-    st.caption("Visual rápido do período diário (1..N do CSV). Tudo calculado localmente (sem LLM).")
+    st.caption("Snapshot = exatamente estes 4 gráficos (PNG).")
 
-    companies_names = ["TOTAL GERAL"] + sorted(daily_table_all["Empresa"].dropna().astype(str).unique().tolist())
+    topn_emp = int(st.session_state.get("snap_topn_emp", 15))
 
-    g1, g2 = st.columns([1.2, 0.8], gap="small")
-    with g1:
-        g_company = st.selectbox("Empresa (escopo dos gráficos)", options=companies_names, index=0, key="graphs_company")
-    with g2:
-        topn_emp = st.selectbox("Top empresas", options=[8, 10, 15, 20, 30], index=2, key="graphs_topn")
+    ts = daily_totals_from_facts(facts, companies_keys, company_name_filter="TOTAL GERAL")
+    top_emp_df = top_companies_from_facts(facts, companies_keys, topn=topn_emp)
+    zero_down = zero_and_down_counts_by_day(daily_table_all, alert_cfg)
 
-    daily_scope = daily_table_all.copy()
-    if g_company != "TOTAL GERAL":
-        daily_scope = daily_scope[daily_scope["Empresa"].astype(str) == str(g_company)].copy()
-
-    ts = daily_totals_from_facts(facts, companies_keys, company_name_filter=g_company)
     if ts.empty:
-        st.info("Sem dados para série diária no escopo atual.")
+        st.info("Sem dados para série diária.")
         st.stop()
-
-    top_emp_df = top_companies_from_facts(facts, companies_keys, topn=int(topn_emp))
-    zero_down = zero_and_down_counts_by_day(daily_scope, alert_cfg)
 
     kA, kB, kC, kD = st.columns(4, gap="small")
     with kA:
@@ -897,42 +1136,18 @@ with tab_graphs:
 
     st.divider()
 
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        st.caption("1) Total de transações por dia (escopo)")
-        fig = px.line(ts, x="date_dt", y="total", markers=True)
-        fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title=None)
-        st.plotly_chart(fig, use_container_width=True)
+    img1 = chart_daily_total(ts, "1) Total de transações por dia (escopo)")
+    st.image(img1, use_container_width=True)
 
-    with c2:
-        st.caption(f"2) Top empresas por volume (período) — Top {int(topn_emp)}")
-        if top_emp_df.empty:
-            st.info("Sem dados para Top empresas.")
-        else:
-            fig = px.bar(
-                top_emp_df.sort_values("total", ascending=True),
-                x="total",
-                y="company_name",
-                orientation="h",
-            )
-            fig.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title=None)
-            st.plotly_chart(fig, use_container_width=True)
+    img2 = chart_top_companies(top_emp_df, f"2) Top empresas por volume (Top {len(top_emp_df)})")
+    st.image(img2, use_container_width=True)
 
-    c3, c4 = st.columns(2, gap="large")
-    with c3:
-        st.caption("3) Contas zeradas por dia (count) — escopo")
-        if zero_down.empty:
-            st.info("Sem dados para zerados por dia.")
-        else:
-            fig = px.line(zero_down, x="date_dt", y="zero_accounts", markers=True)
-            fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title=None)
-            st.plotly_chart(fig, use_container_width=True)
+    img3 = chart_counts(zero_down, "zero_accounts", "3) Contas zeradas por dia (count)")
+    st.image(img3, use_container_width=True)
 
-    with c4:
-        st.caption(f"4) Contas em queda por dia (count) — baseline {alert_cfg.baseline_days}d e limiar {int(alert_cfg.drop_ratio*100)}%")
-        if zero_down.empty:
-            st.info("Sem dados para queda por dia.")
-        else:
-            fig = px.line(zero_down, x="date_dt", y="down_accounts", markers=True)
-            fig.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10), xaxis_title=None, yaxis_title=None)
-            st.plotly_chart(fig, use_container_width=True)
+    img4 = chart_counts(
+        zero_down,
+        "down_accounts",
+        f"4) Contas em queda por dia (baseline {alert_cfg.baseline_days}d / limiar {int(alert_cfg.drop_ratio*100)}%)",
+    )
+    st.image(img4, use_container_width=True)

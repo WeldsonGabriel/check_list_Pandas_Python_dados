@@ -124,17 +124,25 @@ def split_companies_input(text: str) -> List[str]:
 
 
 def parse_count(x) -> int:
-    """BUGFIX: suporta '448.326' / '448,326' etc."""
+    """
+    BUGFIX: suporta '448.326' / '448,326' / '448 326' etc.
+    Observação: aqui tratamos como INTEIRO (removendo separadores).
+    """
     if x is None:
         return 0
     s = str(x).strip()
     if not s:
         return 0
     s = s.replace(" ", "")
+
+    # Se só tem ponto, assume separador de milhar: 448.326 -> 448326
     if "." in s and "," not in s:
         s = s.replace(".", "")
+
+    # remove vírgulas (milhar) e qualquer lixo
     s = s.replace(",", "")
     s = re.sub(r"[^\d\-]", "", s)
+
     try:
         return int(s)
     except Exception:
@@ -228,6 +236,8 @@ def calc_status_volume(
     if var <= thresholds.queda_critica:
         return "Alerta (queda/ zerada)", "Queda crítica vs período anterior", var
 
+    # Nota: aqui você estava usando investigar_abs para o aumento também (mesma faixa).
+    # Mantive exatamente como estava no seu código.
     if var >= thresholds.investigar_abs:
         return "Gerenciar (aumento)", "Aumento relevante vs período anterior", var
 
@@ -347,3 +357,4 @@ def assistant_explain_row(row: pd.Series, cfg: AlertConfig) -> str:
             lines.append(f"- {a}")
 
     return "\n".join(lines)
+    

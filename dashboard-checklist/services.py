@@ -2,11 +2,24 @@
 from __future__ import annotations
 
 import io
+import json
+import os
 import re
-from typing import Optional, List, Dict, Tuple
+import time
+from typing import Optional, List, Dict, Tuple, Sequence
 
 import numpy as np
 import pandas as pd
+
+from urllib import request as _urlrequest
+from urllib.error import HTTPError, URLError
+
+import matplotlib.pyplot as plt
+
+try:
+    import requests
+except Exception:
+    requests = None
 
 from core import (
     Thresholds,
@@ -480,7 +493,7 @@ def build_alerts(
 
 
 # =========================
-# Gráficos (helpers)
+# Gráficos (helpers) - dados
 # =========================
 def daily_totals_from_facts(
     facts: pd.DataFrame,
@@ -564,16 +577,11 @@ def zero_and_down_counts_by_day(
     }).sort_values("date_dt").reset_index(drop=True)
 
     return out
-# =========================
-# Discord Webhooks (Alerts)
-# =========================
-import os
-import json
-import time
-from urllib import request as _urlrequest
-from urllib.error import HTTPError, URLError
 
 
+# =========================
+# Discord Webhooks (Alerts - texto)
+# =========================
 DISCORD_LIMIT = 2000  # hard limit for webhook content
 DISCORD_SAFE = 1900   # keep margin for headers and formatting
 
@@ -708,9 +716,6 @@ def _format_card_from_alert_row(r: pd.Series) -> str:
     total = int(r.get("Total_Periodo", 0))
     ultimo = int(r.get("Ultimo_Dia", 0))
     freq = float(r.get("Freq_pct", 0.0))
-    media = int(round(total / max(1, len(str(r.get("Periodo", ""))) and 1)))  # fallback
-    # a média diária real depende do nº de dias do CSV; vamos calcular por texto do período se vier,
-    # mas no envio vamos preferir o campo motivo_curto e números principais.
 
     z = int(r.get("Streak_zero", 0))
     d = int(r.get("Streak_down", 0))
@@ -778,7 +783,6 @@ def build_discord_report_messages(
     full = header + "\n" + "\n".join(cards).strip()
     return _split_discord_chunks(full, limit=DISCORD_SAFE)
 
-
 def resolve_webhooks_from_sources(
     *,
     secrets: Optional[dict] = None,
@@ -786,37 +790,28 @@ def resolve_webhooks_from_sources(
     manual: Optional[dict] = None,
 ) -> Dict[str, str]:
     """
-    Returns dict with keys: ZERADAS, QUEDA, BLOQUEIO.
+    Returns dict with keys: ZERADAS, QUEDA, BLOQUEIO, SNAPSHOT.
     Priority: manual -> secrets -> env
     Expected secret/env names:
-      DISCORD_WEBHOOK_ZERADAS
-      DISCORD_WEBHOOK_QUEDA
-      DISCORD_WEBHOOK_BLOQUEIO
+      DISCORD_WEBHOOK_SNAPSHOT
     """
     secrets = secrets or {}
     env = env or os.environ
     manual = manual or {}
 
     def pick(key: str) -> str:
-        # manual first
         v = (manual.get(key) or "").strip()
         if v:
             return v
-        # secrets
         v = (secrets.get(key) if isinstance(secrets, dict) else None) or ""
         v = str(v).strip()
         if v:
             return v
-        # env
-        v = str(env.get(key, "") or "").strip()
-        return v
+        return str(env.get(key, "") or "").strip()
 
     return {
-        "ZERADAS": pick("DISCORD_WEBHOOK_ZERADAS"),
-        "QUEDA": pick("DISCORD_WEBHOOK_QUEDA"),
-        "BLOQUEIO": pick("DISCORD_WEBHOOK_BLOQUEIO"),
+        "SNAPSHOT": pick("DISCORD_WEBHOOK_SNAPSHOT"),
     }
-
 
 def send_discord_reports(
     alerts_df: pd.DataFrame,
@@ -847,7 +842,6 @@ def send_discord_reports(
             top_n=int(top_n_each),
         )
 
-        # count items for UX (rough: number of cards = occurrences of "**" header in cards, but we can do df filter)
         if cat == "ZERADAS":
             cnt = int((alerts_df["Streak_zero"] >= int(cfg.zero_yellow)).sum()) if alerts_df is not None and not alerts_df.empty else 0
         elif cat == "QUEDA":
@@ -875,3 +869,235 @@ def send_discord_reports(
             result["errors"][cat] = f"Falhou — {last_msg}"
 
     return result
+
+
+# =========================
+# Discord Webhook (Imagens / Dashboard) - NOVO
+# =========================
+def discord_send_multi_images(
+    webhook_url: str,
+    *,
+    description: str,
+    images: Sequence[tuple[str, bytes]],
+    chunk_size: int = 4,
+) -> tuple[bool, str]:
+    """
+    Envia imagens para Discord usando attachments + embeds.
+    - description: texto do primeiro embed do chunk (nos demais chunks fica vazio)
+    - images: lista de (filename, png_bytes)
+    - chunk_size: manter 4/5 ajuda com limites e rate.
+    """
+    webhook_url = (webhook_url or "").strip()
+    if not webhook_url:
+        return False, "Webhook não configurado."
+
+    if not images:
+        return False, "Sem imagens para enviar."
+
+    if requests is None:
+        return False, "Dependência ausente: requests (pip install requests)."
+
+    for i in range(0, len(images), int(chunk_size)):
+        chunk = list(images[i:i + int(chunk_size)])
+
+        embeds = []
+        for fname, _ in chunk:
+            embeds.append({
+                "title": fname.replace(".png", ""),
+                "description": description if i == 0 else "",
+                "image": {"url": f"attachment://{fname}"},
+                "type": "rich",
+            })
+
+        payload = {"embeds": embeds}
+
+        files = {
+            "payload_json": (None, json.dumps(payload, ensure_ascii=False), "application/json"),
+        }
+        for fname, bts in chunk:
+            files[fname] = (fname, bts, "image/png")
+
+        try:
+            r = requests.post(webhook_url, files=files, timeout=40)
+            if not (200 <= r.status_code < 300):
+                return False, f"Falhou (HTTP {r.status_code}): {r.text[:300]}"
+        except Exception as e:
+            return False, f"Erro ao enviar: {type(e).__name__}: {e}"
+
+    return True, f"Enviado em {((len(images) - 1) // int(chunk_size)) + 1} mensagem(ns)."
+
+
+# =========================
+# PNG charts (Matplotlib) - NOVO
+# =========================
+def _fmt_int_raw(n: int) -> str:
+    try:
+        return f"{int(n)}"
+    except Exception:
+        return "0"
+
+
+def make_line_chart_png(
+    x,
+    y,
+    *,
+    title: str,
+    xlabel: str = "",
+    ylabel: str = "",
+    annotate: bool = True,
+    figsize=(8.2, 3.2),
+) -> bytes:
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111)
+
+    xs = list(x)
+    ys = [int(v) for v in list(y)]
+
+    ax.plot(xs, ys, marker="o")
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    # ticks (evita poluir se for grande)
+    if len(xs) <= 35:
+        ax.set_xticks(xs)
+
+    if annotate:
+        for xi, yi in zip(xs, ys):
+            ax.annotate(
+                _fmt_int_raw(yi),
+                (xi, yi),
+                textcoords="offset points",
+                xytext=(0, 6),
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                fontweight="bold",
+            )
+
+    max_y = max(ys) if ys else 0
+    ax.set_ylim(bottom=0, top=max_y * 1.15 + 1)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def make_barh_chart_png(
+    labels,
+    values,
+    *,
+    title: str,
+    xlabel: str = "",
+    figsize=(8.2, 3.2),
+) -> bytes:
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111)
+
+    labs = [str(x) for x in list(labels)]
+    vals = [int(v) for v in list(values)]
+
+    ax.barh(labs, vals)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+
+    for i, v in enumerate(vals):
+        ax.annotate(
+            _fmt_int_raw(v),
+            (v, i),
+            textcoords="offset points",
+            xytext=(6, 0),
+            ha="left",
+            va="center",
+            fontsize=9,
+            fontweight="bold",
+        )
+
+    max_v = max(vals) if vals else 0
+    ax.set_xlim(left=0, right=max_v * 1.15 + 1)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+def build_daily_dashboard_images(
+    *,
+    ts_daily: pd.DataFrame,          # cols: date_dt, total
+    top_emp_df: pd.DataFrame,        # cols: company_name, total
+    zero_down_df: pd.DataFrame,      # cols: date_dt, zero_accounts, down_accounts
+    title_prefix: str,
+    topn: int,
+) -> list[tuple[str, bytes]]:
+    """
+    Gera 4 imagens em PNG:
+    1) Total por dia
+    2) Top empresas (barra horizontal)
+    3) Contas zeradas por dia (count)
+    4) Contas em queda por dia (count)
+    """
+    images: list[tuple[str, bytes]] = []
+
+    ts = ts_daily.copy()
+    ts["date_dt"] = pd.to_datetime(ts["date_dt"], errors="coerce")
+    ts = ts.dropna(subset=["date_dt"]).sort_values("date_dt")
+    x1 = ts["date_dt"].dt.strftime("%d/%m").tolist()
+    y1 = ts["total"].astype(int).tolist()
+    img1 = make_line_chart_png(
+        x1, y1,
+        title=f"{title_prefix} — 1) Total por dia",
+        xlabel="Dia",
+        ylabel="TX",
+        annotate=True
+    )
+    images.append(("01 - Total por dia.png", img1))
+
+    top = top_emp_df.copy()
+    if not top.empty:
+        top = top.head(int(topn)).copy().sort_values("total", ascending=True)
+        labels = top["company_name"].astype(str).tolist()
+        values = top["total"].astype(int).tolist()
+    else:
+        labels, values = ["Sem dados"], [0]
+
+    img2 = make_barh_chart_png(
+        labels, values,
+        title=f"{title_prefix} — 2) Top {int(topn)} empresas",
+        xlabel="Total (período)"
+    )
+    images.append(("02 - Top empresas.png", img2))
+
+    zd = zero_down_df.copy()
+    if zd is None or zd.empty:
+        zd = pd.DataFrame({"date_dt": ts["date_dt"], "zero_accounts": 0, "down_accounts": 0})
+
+    zd["date_dt"] = pd.to_datetime(zd["date_dt"], errors="coerce")
+    zd = zd.dropna(subset=["date_dt"]).sort_values("date_dt")
+
+    x3 = zd["date_dt"].dt.strftime("%d/%m").tolist()
+    y3 = zd["zero_accounts"].astype(int).tolist()
+    img3 = make_line_chart_png(
+        x3, y3,
+        title=f"{title_prefix} — 3) Contas zeradas (count)",
+        xlabel="Dia",
+        ylabel="Contas",
+        annotate=True
+    )
+    images.append(("03 - Zeradas por dia.png", img3))
+
+    x4 = zd["date_dt"].dt.strftime("%d/%m").tolist()
+    y4 = zd["down_accounts"].astype(int).tolist()
+    img4 = make_line_chart_png(
+        x4, y4,
+        title=f"{title_prefix} — 4) Contas em queda (count)",
+        xlabel="Dia",
+        ylabel="Contas",
+        annotate=True
+    )
+    images.append(("04 - Queda por dia.png", img4))
+
+    return images
